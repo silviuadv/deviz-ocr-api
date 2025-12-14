@@ -204,15 +204,20 @@ def parse_block(block_lines: List[str], default_currency: str) -> Optional[Dict[
     line_total = None
 
     # pret/total: ultimele doua numere din restul blocului
-    unit_price = None
-    line_total = None
+unit_price = None
+line_total = None
 
 # --- regula speciala MANOPERA ---
-if kind == "labor" and len(nums) >= 3:
-    # ex: 4.000 / 60.0000 / 240.00
-    qty = nums[0]
-    unit_price = nums[1]
-    line_total = nums[2]
+if kind == "labor" and nums:
+    # luam doar numerele plauzibile pentru ore/pret
+    labor_nums = [n for n in nums if 0 < n <= 1000]
+
+    if len(labor_nums) >= 3:
+        qty = labor_nums[0]
+        unit_price = labor_nums[1]
+        line_total = labor_nums[2]
+    else:
+        qty = None
 
 else:
     # piese / alte cazuri
