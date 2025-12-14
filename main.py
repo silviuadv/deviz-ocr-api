@@ -46,7 +46,6 @@ UNIT_RE = re.compile(r"\b(buc|buc\.|pcs|ore|ora|h|km|l|ml)\b", re.IGNORECASE)
 # accepta pana la 4 zecimale (1000.0000)
 NUM_RE = re.compile(r"(?<!\w)(\d+(?:\.\d{1,4})?)(?!\w)")
 
-# prinde si "total cu tva"
 TOTAL_LINE_RE = re.compile(
     r"\b(total\s*(de\s*plata|general|cu\s*tva)?|de\s*plata)\b",
     re.IGNORECASE
@@ -55,11 +54,11 @@ TOTAL_LINE_RE = re.compile(
 DATE_RE = re.compile(r"\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b")
 HG_RE = re.compile(r"\bhg\s*\d+\s*/\s*\d+\b", re.IGNORECASE)
 
-# id-uri / serii (si forme cu linii)
 ID_TAG_RE = re.compile(r"\b(id|nr|numar|serie)\s*[:#]", re.IGNORECASE)
 
-# cod piesa tipic: multe litere/cifre fara spatii, minim 6
 PART_CODE_RE = re.compile(r"^[a-z0-9]{6,}$", re.IGNORECASE)
+
+NUM_ONLY_RE = re.compile(r"^\s*\d+(?:\.\d{1,4})?\s*$")
 
 # ---------------- logic ----------------
 
@@ -90,7 +89,11 @@ def guess_kind(desc: str) -> str:
     return "unknown"
 
 def is_noise_line(l: str) -> bool:
-    # IMPORTANT: nu tai linii care incep cu "manopera ..." (alea sunt item-uri)
+    # IMPORTANT: NU tai liniile doar numere (qty/preturi sunt fix astea)
+    if NUM_ONLY_RE.match(l):
+        return False
+
+    # IMPORTANT: NU tai liniile care incep cu "manopera ..." (alea sunt item-uri)
     if l.startswith("manopera "):
         return False
 
@@ -104,7 +107,7 @@ def is_noise_line(l: str) -> bool:
     if HG_RE.search(l):
         return True
 
-    # headere de tabel (dar atentie: doar cele "pure")
+    # headere "pure" (exacte)
     header_exact = [
         "materiale/piese", "materiale", "piese", "manopera",
         "denumire piese si materiale utilizate",
@@ -120,11 +123,7 @@ def is_noise_line(l: str) -> bool:
     if DATE_RE.search(l) and not any(x in l for x in ["ron", "lei", "eur", "euro", "buc", "ore", "ora", "h"]):
         return True
 
-    # linii foarte scurte, fara litere
     if len(l) < 3:
-        return True
-    letters = sum(ch.isalpha() for ch in l)
-    if letters <= 1 and len(l) < 10:
         return True
 
     return False
@@ -149,11 +148,14 @@ def looks_like_item_start(line: str) -> bool:
 
     return False
 
-def _pick_qty_from_nums(nums: List[float]) -> Optional[float]:
-    # pentru devize auto: qty tipic e intre 0.001 si 100 (1.000, 4.000, 1.5 etc)
-    for n in nums:
-        if 0.001 <= n <= 100:
-            return n
+def pick_qty_from_block_lines(block_lines: List[str]) -> Optional[float]:
+    # cauta o linie "numar pur" (ex: 1.000 / 4.000 / 1.500) -> qty
+    for ln in block_lines:
+        nln = normalize_line(ln)
+        if NUM_ONLY_RE.match(nln):
+            val = float(nln)
+            if 0.001 <= val <= 100:
+                return val
     return None
 
 def parse_block(block_lines: List[str], default_currency: str) -> Optional[Dict[str, Any]]:
@@ -175,36 +177,7 @@ def parse_block(block_lines: List[str], default_currency: str) -> Optional[Dict[
         if unit == "ora":
             unit = "ore"
 
-    nums = [float(x) for x in NUM_RE.findall(lblock)]
-
-    # qty: daca nu apare "1.000 buc" pe aceeasi linie, ia primul numar mic ca qty
-    qty = None
-    if unit:
-        m_qty = re.search(rf"\b(\d+(?:\.\d+)?)\s*{re.escape(unit)}\b", lblock)
-        if m_qty:
-            qty = float(m_qty.group(1))
-    if qty is None and unit and nums:
-        qty = _pick_qty_from_nums(nums)
-
-    unit_price = None
-    line_total = None
-
-    # euristica pentru randuri de tabel:
-    # - daca ai 3 numere: [qty, unit_price, line_total] (sau [qty, pret_lista, pret_deviz, valoare] etc)
-    # - luam de regula ultimele doua ca pret si total, iar qty din primul "mic"
-    if len(nums) >= 1:
-        line_total = nums[-1]
-    if len(nums) >= 2:
-        unit_price = nums[-2]
-
-    # daca avem qty si nu avem unit_price dar avem un total, incearca unit_price = total/qty
-    if qty is not None and line_total is not None and unit_price is None and qty != 0:
-        unit_price = line_total / qty
-
-    # guardrail: ignora "totaluri" absurde per linie
-    if line_total is not None and line_total > 100000:
-        return None
-
+    # descriere: folosim doar prima linie (ca sa nu contaminaram cu subtotal/total)
     first_line = normalize_line(block_lines[0])
     desc = first_line
     desc = CURRENCY_RE.sub(" ", desc)
@@ -214,8 +187,30 @@ def parse_block(block_lines: List[str], default_currency: str) -> Optional[Dict[
 
     kind = guess_kind(desc)
 
-    # nu pastra blocuri care sunt doar text + cifre irelevante
-    if kind == "unknown" and qty is None and unit is None and unit_price is None and line_total is None:
+    # NUMERE: le luam doar din restul blocului (nu din prima linie, ca acolo ai "SET 12")
+    rest_text = normalize_text("\n".join(block_lines[1:])) if len(block_lines) > 1 else ""
+    nums = [float(x) for x in NUM_RE.findall(rest_text)]
+
+    # qty
+    qty = None
+    if unit:
+        m_qty = re.search(rf"\b(\d+(?:\.\d+)?)\s*{re.escape(unit)}\b", lblock)
+        if m_qty:
+            qty = float(m_qty.group(1))
+    if qty is None:
+        qty = pick_qty_from_block_lines(block_lines)
+
+    unit_price = None
+    line_total = None
+
+    # pret/total: ultimele doua numere din restul blocului
+    if len(nums) >= 1:
+        line_total = nums[-1]
+    if len(nums) >= 2:
+        unit_price = nums[-2]
+
+    # guardrail: sume absurde per linie
+    if line_total is not None and line_total > 100000:
         return None
 
     warnings = []
@@ -236,6 +231,10 @@ def parse_block(block_lines: List[str], default_currency: str) -> Optional[Dict[
     else:
         warnings.append("missing_fields")
 
+    # daca e doar zgomot, nu pastram
+    if kind == "unknown" and qty is None and unit is None and unit_price is None and line_total is None:
+        return None
+
     return {
         "raw": raw_block,
         "desc": desc,
@@ -252,14 +251,13 @@ def parse_block(block_lines: List[str], default_currency: str) -> Optional[Dict[
 def extract_total(text: str, currency_default: str) -> Optional[Dict[str, Any]]:
     lines = [normalize_line(x) for x in text.split("\n")]
 
-    # 1) cauta "total..." si ia numarul de pe aceeasi linie sau de pe linia urmatoare
+    # 1) cauta "total..." si numarul de pe aceeasi linie sau de pe urmatoarele 1-3 linii
     for i, ln in enumerate(lines):
         if TOTAL_LINE_RE.search(ln):
             nums = [float(x) for x in NUM_RE.findall(ln)]
             if nums:
                 return {"total": nums[-1], "currency": currency_default}
 
-            # daca pe linia "Total cu TVA:" nu e numar, cauta 1-3 linii dupa
             for j in range(1, 4):
                 if i + j < len(lines):
                     nxt = lines[i + j]
@@ -267,9 +265,8 @@ def extract_total(text: str, currency_default: str) -> Optional[Dict[str, Any]]:
                     if nums2:
                         return {"total": nums2[-1], "currency": currency_default}
 
-    # 2) fallback: cauta in finalul documentului cel mai mare numar plauzibil,
-    # dar EXCLUDE liniile cu ID/serie (ex: ID:62-7304-46037)
-    tail = lines[-120:] if len(lines) > 120 else lines
+    # 2) fallback: max plauzibil din coada, dar exclude ID-uri
+    tail = lines[-140:] if len(lines) > 140 else lines
     nums_tail: List[float] = []
 
     for ln in tail:
@@ -279,9 +276,7 @@ def extract_total(text: str, currency_default: str) -> Optional[Dict[str, Any]]:
             continue
         if "km.bord" in ln or "km bord" in ln:
             continue
-        if ID_TAG_RE.search(ln):
-            continue  # asta elimina fix cazul 46037 din ID
-        if "id:" in ln:
+        if ID_TAG_RE.search(ln) or "id:" in ln:
             continue
 
         nums = [float(x) for x in NUM_RE.findall(ln)]
@@ -305,26 +300,37 @@ def parse(payload: InputPayload):
         nln = normalize_line(ln)
         if not nln:
             continue
+        # IMPORTANT: nu arunca liniile cu numere
         if is_noise_line(nln):
             continue
         cleaned_lines.append(ln)
 
-    # construieste blocuri: cod piesa / manopera ... = inceput de item
+    # construieste blocuri + rupe blocul la SUBTOTAL / ID:
     blocks: List[List[str]] = []
     current: List[str] = []
 
+    def flush_current():
+        nonlocal current
+        if current:
+            blocks.append(current)
+            current = []
+
     for ln in cleaned_lines:
         nln = normalize_line(ln)
+
+        # boundary: subtotal / id -> inchide blocul si nu include linia
+        if "subtotal" in nln or nln.startswith("id:") or ID_TAG_RE.search(nln):
+            flush_current()
+            continue
+
         if looks_like_item_start(nln):
-            if current:
-                blocks.append(current)
+            flush_current()
             current = [ln]
         else:
             if current:
                 current.append(ln)
 
-    if current:
-        blocks.append(current)
+    flush_current()
 
     items: List[Dict[str, Any]] = []
     for b in blocks:
@@ -334,6 +340,7 @@ def parse(payload: InputPayload):
 
     totals = extract_total(payload.ocr_text, default_currency)
 
+    # suma liniilor: doar line_total plauzibil
     line_totals = [
         x["line_total"]
         for x in items
