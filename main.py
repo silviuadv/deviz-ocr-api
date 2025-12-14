@@ -207,6 +207,20 @@ def parse_block(block_lines: List[str], default_currency: str) -> Optional[Dict[
     if len(nums) >= 2:
         unit_price = nums[-2]
 
+    # ---------------- FIXES FOR PART LINES ----------------
+    # Fix 1: if qty=1 and only one price candidate exists -> that price is both unit_price and total
+    if qty == 1.0:
+        price_candidates = [n for n in nums if n >= 0.01]
+        if len(price_candidates) == 1:
+            unit_price = price_candidates[0]
+            line_total = price_candidates[0]
+
+    # Fix 2: if we have qty and total, choose unit_price closest to total/qty
+    if qty is not None and line_total is not None and nums and qty != 0:
+        target_price = line_total / qty
+        unit_price = min(nums, key=lambda x: abs(x - target_price))
+    # ------------------------------------------------------
+
     if isinstance(line_total, float) and line_total > 100000:
         return None
 
@@ -285,18 +299,16 @@ def extract_total(text: str, currency_default: str) -> Optional[Dict[str, Any]]:
         return None
     return {"total": max(nums_tail), "currency": currency_default}
 
-# ---------------- Labor section parser (UPDATED) ----------------
+# ---------------- Labor section parser (column-based) ----------------
 
 def parse_labor_section(clean_lines: List[str], default_currency: str) -> List[Dict[str, Any]]:
     nlines = [normalize_line(x) for x in clean_lines]
 
-    # find "manopera" section start
     try:
         start_idx = next(i for i, ln in enumerate(nlines) if ln.strip() == "manopera")
     except StopIteration:
         return []
 
-    # collect labor descriptions until ID/subtotal
     labor_descs: List[str] = []
     i = start_idx + 1
     while i < len(nlines):
@@ -319,12 +331,11 @@ def parse_labor_section(clean_lines: List[str], default_currency: str) -> List[D
     if target == 0:
         return []
 
-    # helper: parse float + decimals from numeric-only line
     def parse_num_and_decimals(raw_line: str) -> Optional[Tuple[float, int]]:
         s = clean_text(raw_line)
         s = s.replace("\u00a0", " ")
-        s = re.sub(r"(?<=\d),(?=\d{3}\b)", "", s)  # thousands
-        s = re.sub(r"(\d),(\d)", r"\1.\2", s)      # decimals
+        s = re.sub(r"(?<=\d),(?=\d{3}\b)", "", s)
+        s = re.sub(r"(\d),(\d)", r"\1.\2", s)
         s = s.strip()
         if not NUM_ONLY_RE.match(s):
             return None
@@ -336,52 +347,35 @@ def parse_labor_section(clean_lines: List[str], default_currency: str) -> List[D
         except Exception:
             return None
 
-    # collect numeric-only tuples after we hit the ID/subtotal zone
     nums_tuples: List[Tuple[float, int]] = []
     for j in range(i, len(nlines)):
-        raw = clean_lines[j]
         nl = nlines[j].strip()
-
-        parsed = parse_num_and_decimals(raw)
+        parsed = parse_num_and_decimals(clean_lines[j])
         if parsed:
             v, d = parsed
             if 0 < v <= 100000:
                 nums_tuples.append((v, d))
-
         if "total cu tva" in nl:
             break
 
-    # --- COLUMN MODE (robust for your OCR) ---
-    # qty: 3 decimals (4.000, 1.500, 5.000)
     qtys = [v for (v, d) in nums_tuples if d == 3 and 0.001 <= v <= 100]
-    # unit_price: 4 decimals (60.0000, 80.0000)
     prices = [v for (v, d) in nums_tuples if d == 4 and 0.01 <= v <= 10000]
-    # totals: 2 decimals (240.00, 90.00, 400.00) - luam doar primele candidate rezonabile
     totals = [v for (v, d) in nums_tuples if d == 2 and 0.01 <= v <= 100000]
 
-    # curata: scoate subtotalul daca pare a fi ultimul (de obicei e mai mare decat totalurile pe rand)
-    # dar fara sa risti sa omori totalul real: pastram doar primele target totaluri dupa ce avem qty+price
     if len(totals) > target:
         totals = totals[:target]
 
-    # daca avem suficiente pe coloane, folosim asta direct
     triplets: List[Tuple[Optional[float], Optional[float], Optional[float]]] = []
-    if len(qtys) >= target and len(prices) >= target and len(totals) >= target:
-        for idx in range(target):
-            triplets.append((qtys[idx], prices[idx], totals[idx]))
-    else:
-        # fallback: daca nu au venit zecimalele cum ne asteptam, nu crapa, doar lasa missing_fields
-        for idx in range(target):
-            q = qtys[idx] if idx < len(qtys) else None
-            p = prices[idx] if idx < len(prices) else None
-            t = totals[idx] if idx < len(totals) else None
-            triplets.append((q, p, t))
+    for idx in range(target):
+        q = qtys[idx] if idx < len(qtys) else None
+        p = prices[idx] if idx < len(prices) else None
+        t = totals[idx] if idx < len(totals) else None
+        triplets.append((q, p, t))
 
     items: List[Dict[str, Any]] = []
     for idx, desc_raw in enumerate(labor_descs):
         desc_norm = normalize_line(desc_raw).replace("manopera ", "").strip()
-
-        qty, unit_price, line_total = triplets[idx] if idx < len(triplets) else (None, None, None)
+        qty, unit_price, line_total = triplets[idx]
 
         warnings: List[str] = []
         confidence = {"qty": 0.0, "unit": 0.0, "unit_price": 0.0, "line_total": 0.0}
@@ -427,10 +421,8 @@ def parse(payload: InputPayload):
             continue
         cleaned_lines.append(ln)
 
-    # labor section parsing
     labor_items = parse_labor_section(cleaned_lines, default_currency)
 
-    # generic blocks (parts/fees). skip labor lines here
     blocks: List[List[str]] = []
     current: List[str] = []
 
