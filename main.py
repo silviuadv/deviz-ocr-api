@@ -9,7 +9,7 @@ class Vehicle(BaseModel):
     brand: Optional[str] = None
     model: Optional[str] = None
     engine: Optional[str] = None
-    model_years: Optional[str] = None
+    year_range: Optional[str] = None
 
 class InputPayload(BaseModel):
     vin: str
