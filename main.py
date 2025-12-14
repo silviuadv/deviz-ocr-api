@@ -334,37 +334,44 @@ def parse_labor_section(clean_lines: List[str], default_currency: str) -> List[D
         if "total cu tva" in ln:
             break
 
-    # greedy build triplets using consistency check
-    triplets: List[Tuple[float, float, float]] = []
-    k = 0
-    while k < len(numeric_vals):
-        # try to find earliest (qty, unit_price, total) where qty<=100 and total approx qty*unit_price
-        found = False
-        for a in range(k, min(k + 5, len(numeric_vals))):
-            qty = numeric_vals[a]
-            if not (0.001 <= qty <= 100):
+    # find exactly as many triplets as we have labor descriptions
+target = len(labor_descs)
+triplets: List[Tuple[float, float, float]] = []
+
+k = 0
+while k < len(numeric_vals) and len(triplets) < target:
+    found = False
+
+    # try to match a triplet starting at/after k
+    for a in range(k, min(k + 6, len(numeric_vals))):
+        qty = numeric_vals[a]
+        if not (0.001 <= qty <= 100):
+            continue
+
+        for b in range(a + 1, min(a + 8, len(numeric_vals))):
+            unit_price = numeric_vals[b]
+            if not (0.01 <= unit_price <= 10000):
                 continue
-            for b in range(a + 1, min(a + 6, len(numeric_vals))):
-                unit_price = numeric_vals[b]
-                if not (0.01 <= unit_price <= 10000):
+
+            for c in range(b + 1, min(b + 8, len(numeric_vals))):
+                total = numeric_vals[c]
+                if total <= 0:
                     continue
-                for c in range(b + 1, min(b + 6, len(numeric_vals))):
-                    total = numeric_vals[c]
-                    if total <= 0:
-                        continue
-                    calc = qty * unit_price
-                    if abs(calc - total) <= max(1.0, 0.05 * total):
-                        triplets.append((qty, unit_price, total))
-                        k = c + 1
-                        found = True
-                        break
-                if found:
+
+                calc = qty * unit_price
+                if abs(calc - total) <= max(1.0, 0.05 * total):
+                    triplets.append((qty, unit_price, total))
+                    k = c + 1
+                    found = True
                     break
+
             if found:
                 break
+        if found:
+            break
 
-        if not found:
-            k += 1
+    if not found:
+        k += 1
 
     items: List[Dict[str, Any]] = []
     for idx, desc_raw in enumerate(labor_descs):
