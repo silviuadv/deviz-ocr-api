@@ -16,81 +16,41 @@ class InputPayload(BaseModel):
     vehicle: Optional[Vehicle] = None
     ocr_text: str
 
-# --- helpers ---
-
 def clean_text(s: str) -> str:
     s = s.replace("\t", " ")
     s = re.sub(r"[ ]{2,}", " ", s)
     s = s.replace("\u00a0", " ")
     return s.strip()
 
-def normalize_line(s: str) -> str:
+def normalize_text(s: str) -> str:
     s = clean_text(s).lower()
 
-    # 2,142.00 -> 2142.00 (virgula ca separator de mii)
+    # 2,142.00 -> 2142.00 (virgula separator de mii)
     s = re.sub(r"(?<=\d),(?=\d{3}\b)", "", s)
 
-    # 1,50 -> 1.50 (virgula ca separator zecimal)
+    # 1,50 -> 1.50 (virgula separator zecimal)
     s = re.sub(r"(\d),(\d)", r"\1.\2", s)
 
     return s
 
-# pattern-uri de zgomot
-DATE_RE = re.compile(r"\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b")
-YEAR_RE = re.compile(r"\b(19\d{2}|20\d{2})\b")
-ID_LIKE_RE = re.compile(r"\b(id|nr|numar|serie)\s*[:#]?\s*[\w-]{6,}\b", re.IGNORECASE)
+def normalize_line(s: str) -> str:
+    return normalize_text(s)
 
-def is_header_or_noise(line: str) -> bool:
-    noise_keywords = [
-        "deviz", "factura", "client", "cui", "nr", "data", "adresa",
-        "telefon", "email", "subtotal", "tva", "serie", "numar",
-        # headere de tabel
-        "materiale/piese", "manopera", "denumire", "u/m", "cantitate",
-        "pret lista", "pret deviz", "valoare", "red", "km.bord", "km bord",
-        "descriere obiect", "beneficiar", "comanda", "observatii",
-    ]
+# --------- regex-uri utile ---------
 
-    footer_noise = [
-        "generat cu", "autodeviz", "produs al", "vega", "web", "www", "http", "https",
-        "pagina", "page", "semnatura", "stampila",
-        "in conformitate cu", "unitatea noastra garanteaza",
-        "hg ",  # HG 394/1995 etc.
-    ]
-
-    if any(k in line for k in footer_noise):
-        return True
-
-    if len(line) < 3:
-        return True
-
-    letters = sum(ch.isalpha() for ch in line)
-    if letters <= 1 and len(line) < 10:
-        return True
-
-    # daca e un header clar (cu keyword-uri) si NU are preturi/unitati, il tai
-    if any(k in line for k in noise_keywords):
-        # daca are unitati/moneda, poate fi item, nu tai automat
-        if any(u in line for u in ["buc", "ore", "ora", "h", "pcs", "lei", "ron", "eur", "euro"]):
-            return False
-        # daca are cifre dar e gen "km.bord 120000", tot zgomot
-        return True
-
-    return False
-
-# detectii
 CURRENCY_RE = re.compile(r"\b(ron|lei|eur|euro)\b", re.IGNORECASE)
 UNIT_RE = re.compile(r"\b(buc|buc\.|pcs|ore|ora|h|km|l|ml)\b", re.IGNORECASE)
 
-# numere: accepta pana la 4 zecimale (1000.0000)
-MONEY_NUM_RE = re.compile(r"(?<!\w)(\d+(?:\.\d{1,4})?)(?!\w)")
+# accepta pana la 4 zecimale (1000.0000)
+NUM_RE = re.compile(r"(?<!\w)(\d+(?:\.\d{1,4})?)(?!\w)")
 
-QTY_HINT_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*(x|\*)\b", re.IGNORECASE)
+TOTAL_LINE_RE = re.compile(r"\b(total\s*(de\s*plata|general|cu\s*tva)?|de\s*plata)\b", re.IGNORECASE)
 
-# include si "total cu tva"
-TOTAL_LINE_RE = re.compile(
-    r"\b(total\s*(de\s*plata|general|cu\s*tva)?|de\s*plata)\b",
-    re.IGNORECASE
-)
+DATE_RE = re.compile(r"\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b")
+HG_RE = re.compile(r"\bhg\s*\d+\s*/\s*\d+\b", re.IGNORECASE)
+
+# cod piesa tipic: multe cifre/litere fara spatii, minim 6-7 caractere
+PART_CODE_RE = re.compile(r"^[a-z0-9]{6,}$", re.IGNORECASE)
 
 def detect_currency(text: str) -> str:
     hits = CURRENCY_RE.findall(text)
@@ -105,8 +65,9 @@ def detect_currency(text: str) -> str:
 
 def guess_kind(desc: str) -> str:
     labor_k = ["manopera", "ore", "ora", "labor", "diagnoza", "diagnostic", "verificare"]
-    fee_k = ["taxa", "consumabile", "materiale", "transport", "ecotaxa", "materiale/piese"]
-    part_k = ["filtru", "ulei", "placute", "disc", "kit", "buj", "piesa", "garnitura", "curea", "pompa", "senzor", "acumulator", "agrafe", "accesorii"]
+    fee_k = ["taxa", "consumabile", "materiale", "transport", "ecotaxa"]
+    part_k = ["filtru", "ulei", "placute", "disc", "kit", "buj", "piesa", "garnitura", "curea", "pompa", "senzor",
+              "acumulator", "agrafe", "accesorii", "frana"]
     if any(k in desc for k in labor_k):
         return "labor"
     if any(k in desc for k in fee_k):
@@ -115,46 +76,96 @@ def guess_kind(desc: str) -> str:
         return "part"
     return "unknown"
 
-def parse_item_line(line: str, default_currency: str) -> Optional[Dict[str, Any]]:
-    raw = clean_text(line)
-    l = normalize_line(line)
+def is_noise_line(l: str) -> bool:
+    # footer/header frecvent
+    footer_noise = [
+        "generat cu", "autodeviz", "produs al", "vega", "web", "www", "http", "https",
+        "pagina", "page", "semnatura", "stampila",
+        "in conformitate cu", "unitatea noastra garanteaza",
+    ]
+    if any(k in l for k in footer_noise):
+        return True
+    if HG_RE.search(l):
+        return True
+    if len(l) < 3:
+        return True
+    # linii de coloane / titluri tabel
+    header_k = [
+        "materiale/piese", "manopera", "denumire", "u/m", "cantitate",
+        "pret lista", "pret deviz", "valoare", "red", "subtotal", "tva",
+        "beneficiar", "comanda", "observatii", "descriere obiect",
+        "km.bord", "km bord",
+    ]
+    if any(k in l for k in header_k):
+        return True
+    # linii cu date (cand nu sunt clar item)
+    if DATE_RE.search(l) and not any(u in l for u in ["buc", "ore", "ora", "h", "ron", "lei", "eur", "euro"]):
+        return True
+    return False
 
-    if is_header_or_noise(l):
+# --------- parser pe blocuri ---------
+
+def looks_like_item_start(line: str) -> bool:
+    """
+    Detecteaza inceput de item.
+    Exemplu: "5NU0QXG89 ACUMULATOR 60AH"
+    """
+    if not line:
+        return False
+    parts = line.split()
+    if len(parts) < 2:
+        return False
+    first = parts[0]
+    # cod fara spatii, destul de lung
+    if PART_CODE_RE.match(first) and len(first) >= 6:
+        # sa nu fie "subtotal", "total", etc
+        if first in ["subtotal", "total"]:
+            return False
+        return True
+    return False
+
+def parse_block(block_lines: List[str], default_currency: str) -> Optional[Dict[str, Any]]:
+    """
+    Dintr-un bloc (item start + urmatoarele linii) extrage:
+    desc, qty, unit, unit_price, line_total.
+    """
+    raw_block = "\n".join(block_lines).strip()
+    if not raw_block:
         return None
 
-    # filtre tari: date / ani / id-uri (cand nu e linie de item)
-    if DATE_RE.search(l) and not any(x in l for x in ["buc", "ore", "ora", "h", "ron", "lei", "eur", "euro"]):
-        return None
-    if ("hg" in l) or ("km.bord" in l) or ("km bord" in l):
-        return None
-    if ID_LIKE_RE.search(l) and not any(x in l for x in ["ron", "lei", "eur", "euro"]):
-        return None
+    lblock = normalize_text(raw_block)
 
+    # currency
     currency = default_currency
-    if CURRENCY_RE.search(l):
-        c = detect_currency(l)
+    if CURRENCY_RE.search(lblock):
+        c = detect_currency(lblock)
         currency = c if c != "mixed" else default_currency
 
+    # unit
     unit = None
-    um = UNIT_RE.search(l)
+    um = UNIT_RE.search(lblock)
     if um:
         unit = um.group(1).lower().replace(".", "")
         if unit == "ora":
             unit = "ore"
 
+    # qty (cauta "12 buc" sau "4 ore")
     qty = None
     if unit:
-        m_qty = re.search(rf"\b(\d+(?:\.\d+)?)\s*{re.escape(unit)}\b", l)
+        m_qty = re.search(rf"\b(\d+(?:\.\d+)?)\s*{re.escape(unit)}\b", lblock)
         if m_qty:
             qty = float(m_qty.group(1))
 
-    if qty is None:
-        m = QTY_HINT_RE.search(l)
-        if m:
-            qty = float(m.group(1))
+    # toate numerele din bloc
+    nums = [float(x) for x in NUM_RE.findall(lblock)]
 
-    nums = [float(x) for x in MONEY_NUM_RE.findall(l)]
+    # guardrail: daca nu sunt numere deloc, nu e item util
+    if not nums:
+        # dar pastram piesa ca item "fara pret" daca pare piesa
+        pass
 
+    # euristica pentru devize tip tabel:
+    # ultimele 1-3 numere tind sa fie: pret_lista, pret_deviz, valoare
     unit_price = None
     line_total = None
 
@@ -163,9 +174,20 @@ def parse_item_line(line: str, default_currency: str) -> Optional[Dict[str, Any]
     if len(nums) >= 2:
         unit_price = nums[-2]
 
-    # Guardrail: sume absurde (OCR/parse gresit)
+    # guardrail: sume absurde
     if line_total is not None and line_total > 100000:
         return None
+
+    # desc: luam prima linie a blocului (de obicei cod + descriere)
+    first_line = normalize_line(block_lines[0])
+    # scoatem numere/unitati/moneda din prima linie ca sa ramana text
+    desc = first_line
+    desc = CURRENCY_RE.sub(" ", desc)
+    desc = UNIT_RE.sub(" ", desc)
+    desc = NUM_RE.sub(" ", desc)
+    desc = re.sub(r"\s{2,}", " ", desc).strip(" -;:/")
+
+    kind = guess_kind(desc)
 
     warnings = []
     confidence = {"qty": 0.0, "unit": 0.0, "unit_price": 0.0, "line_total": 0.0}
@@ -179,23 +201,6 @@ def parse_item_line(line: str, default_currency: str) -> Optional[Dict[str, Any]
     if line_total is not None:
         confidence["line_total"] = 0.7
 
-    desc = l
-    desc = CURRENCY_RE.sub(" ", desc)
-    desc = UNIT_RE.sub(" ", desc)
-    desc = MONEY_NUM_RE.sub(" ", desc)
-    desc = re.sub(r"\s{2,}", " ", desc).strip(" -;:/")
-
-    kind = guess_kind(desc)
-
-    # daca descrierea e practic goala si nu ai bani reali, nu e item
-    if len(desc) < 3 and len(nums) <= 1:
-        return None
-
-    # daca nu pare item (fara cantitate/unitate/pret) si e unknown, ignora
-    if kind == "unknown" and qty is None and unit is None and unit_price is None:
-        return None
-
-    # sanity checks
     if qty and unit_price and line_total:
         calc = qty * unit_price
         if abs(calc - line_total) > max(1.0, 0.05 * line_total):
@@ -203,8 +208,12 @@ def parse_item_line(line: str, default_currency: str) -> Optional[Dict[str, Any]
     else:
         warnings.append("missing_fields")
 
+    # daca e doar header sau zgomot mascat, nu-l salvam
+    if kind == "unknown" and qty is None and unit is None and unit_price is None and line_total is None:
+        return None
+
     return {
-        "raw": raw,
+        "raw": raw_block,
         "desc": desc,
         "kind": kind,
         "qty": qty,
@@ -221,9 +230,8 @@ def extract_total(text: str, currency_default: str) -> Optional[Dict[str, Any]]:
     candidates = []
     for ln in lines:
         if TOTAL_LINE_RE.search(ln):
-            nums = [float(x) for x in MONEY_NUM_RE.findall(ln)]
+            nums = [float(x) for x in NUM_RE.findall(ln)]
             if nums:
-                # la "total cu tva: 2142.00" ultimul numar e totalul
                 candidates.append(nums[-1])
     if not candidates:
         return None
@@ -233,15 +241,44 @@ def extract_total(text: str, currency_default: str) -> Optional[Dict[str, Any]]:
 def parse(payload: InputPayload):
     default_currency = detect_currency(payload.ocr_text)
 
+    # 1) curatare linii
+    raw_lines = payload.ocr_text.split("\n")
+    lines = []
+    for ln in raw_lines:
+        nl = normalize_line(ln)
+        if not nl:
+            continue
+        if is_noise_line(nl):
+            continue
+        lines.append(ln)  # pastram originalul pentru raw
+
+    # 2) construim blocuri: item start + urmatoarele linii pana la urmatorul item start
+    blocks: List[List[str]] = []
+    current: List[str] = []
+
+    for ln in lines:
+        nln = normalize_line(ln)
+        if looks_like_item_start(nln):
+            if current:
+                blocks.append(current)
+            current = [ln]
+        else:
+            if current:
+                # continua blocul curent
+                current.append(ln)
+
+    if current:
+        blocks.append(current)
+
+    # 3) parse pe blocuri
     items: List[Dict[str, Any]] = []
-    for line in payload.ocr_text.split("\n"):
-        parsed = parse_item_line(line, default_currency)
+    for b in blocks:
+        parsed = parse_block(b, default_currency)
         if parsed:
             items.append(parsed)
 
     totals = extract_total(payload.ocr_text, default_currency)
 
-    # sumar: suma doar din valori “plauzibile”
     line_totals = [
         x["line_total"]
         for x in items
