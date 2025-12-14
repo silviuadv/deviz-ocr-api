@@ -315,85 +315,90 @@ def parse_labor_section(clean_lines: List[str], default_currency: str) -> List[D
 
         i += 1
 
-    # collect numeric-only values after that point
-    numeric_vals: List[float] = []
-    for j in range(i, len(nlines)):
-        ln = nlines[j].strip()
-        if NUM_ONLY_RE.match(ln):
-            try:
-                v = float(ln)
-            except Exception:
-                continue
-            if 0 < v <= 100000:
-                numeric_vals.append(v)
+    target = len(labor_descs)
+    if target == 0:
+        return []
 
-        if "total cu tva" in ln:
+    # helper: parse float + decimals from numeric-only line
+    def parse_num_and_decimals(raw_line: str) -> Optional[Tuple[float, int]]:
+        s = clean_text(raw_line)
+        s = s.replace("\u00a0", " ")
+        s = re.sub(r"(?<=\d),(?=\d{3}\b)", "", s)  # thousands
+        s = re.sub(r"(\d),(\d)", r"\1.\2", s)      # decimals
+        s = s.strip()
+        if not NUM_ONLY_RE.match(s):
+            return None
+        dec = 0
+        if "." in s:
+            dec = len(s.split(".")[-1])
+        try:
+            return float(s), dec
+        except Exception:
+            return None
+
+    # collect numeric-only tuples after we hit the ID/subtotal zone
+    nums_tuples: List[Tuple[float, int]] = []
+    for j in range(i, len(nlines)):
+        raw = clean_lines[j]
+        nl = nlines[j].strip()
+
+        parsed = parse_num_and_decimals(raw)
+        if parsed:
+            v, d = parsed
+            if 0 < v <= 100000:
+                nums_tuples.append((v, d))
+
+        if "total cu tva" in nl:
             break
 
-    # UPDATED: find exactly N triplets (N = number of labor lines)
-    target = len(labor_descs)
-    triplets: List[Tuple[float, float, float]] = []
+    # --- COLUMN MODE (robust for your OCR) ---
+    # qty: 3 decimals (4.000, 1.500, 5.000)
+    qtys = [v for (v, d) in nums_tuples if d == 3 and 0.001 <= v <= 100]
+    # unit_price: 4 decimals (60.0000, 80.0000)
+    prices = [v for (v, d) in nums_tuples if d == 4 and 0.01 <= v <= 10000]
+    # totals: 2 decimals (240.00, 90.00, 400.00) - luam doar primele candidate rezonabile
+    totals = [v for (v, d) in nums_tuples if d == 2 and 0.01 <= v <= 100000]
 
-    k = 0
-    while k < len(numeric_vals) and len(triplets) < target:
-        found = False
+    # curata: scoate subtotalul daca pare a fi ultimul (de obicei e mai mare decat totalurile pe rand)
+    # dar fara sa risti sa omori totalul real: pastram doar primele target totaluri dupa ce avem qty+price
+    if len(totals) > target:
+        totals = totals[:target]
 
-        for a in range(k, min(k + 6, len(numeric_vals))):
-            qty = numeric_vals[a]
-            if not (0.001 <= qty <= 100):
-                continue
-
-            for b in range(a + 1, min(a + 8, len(numeric_vals))):
-                unit_price = numeric_vals[b]
-                if not (0.01 <= unit_price <= 10000):
-                    continue
-
-                for c in range(b + 1, min(b + 8, len(numeric_vals))):
-                    total = numeric_vals[c]
-                    if total <= 0:
-                        continue
-
-                    calc = qty * unit_price
-                    if abs(calc - total) <= max(1.0, 0.05 * total):
-                        triplets.append((qty, unit_price, total))
-                        k = c + 1
-                        found = True
-                        break
-
-                if found:
-                    break
-            if found:
-                break
-
-        if not found:
-            k += 1
+    # daca avem suficiente pe coloane, folosim asta direct
+    triplets: List[Tuple[Optional[float], Optional[float], Optional[float]]] = []
+    if len(qtys) >= target and len(prices) >= target and len(totals) >= target:
+        for idx in range(target):
+            triplets.append((qtys[idx], prices[idx], totals[idx]))
+    else:
+        # fallback: daca nu au venit zecimalele cum ne asteptam, nu crapa, doar lasa missing_fields
+        for idx in range(target):
+            q = qtys[idx] if idx < len(qtys) else None
+            p = prices[idx] if idx < len(prices) else None
+            t = totals[idx] if idx < len(totals) else None
+            triplets.append((q, p, t))
 
     items: List[Dict[str, Any]] = []
     for idx, desc_raw in enumerate(labor_descs):
-        desc_norm = normalize_line(desc_raw)
-        qty = None
-        unit_price = None
-        line_total = None
+        desc_norm = normalize_line(desc_raw).replace("manopera ", "").strip()
 
-        if idx < len(triplets):
-            qty, unit_price, line_total = triplets[idx]
+        qty, unit_price, line_total = triplets[idx] if idx < len(triplets) else (None, None, None)
 
         warnings: List[str] = []
         confidence = {"qty": 0.0, "unit": 0.0, "unit_price": 0.0, "line_total": 0.0}
 
         if qty is not None:
-            confidence["qty"] = 0.85
+            confidence["qty"] = 0.9
         if unit_price is not None:
-            confidence["unit_price"] = 0.85
+            confidence["unit_price"] = 0.9
         if line_total is not None:
-            confidence["line_total"] = 0.85
+            confidence["line_total"] = 0.9
 
         if qty is None or unit_price is None or line_total is None:
             warnings.append("missing_fields")
 
         items.append({
             "raw": desc_raw,
-            "desc": desc_norm.replace("manopera ", "").strip(),
+            "desc": desc_norm,
             "kind": "labor",
             "qty": qty,
             "unit": "ore",
