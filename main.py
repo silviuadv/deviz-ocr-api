@@ -101,7 +101,6 @@ def is_noise_line(l: str) -> bool:
     if HG_RE.search(l):
         return True
 
-    # exact headers
     header_exact = {
         "materiale/piese",
         "denumire piese si materiale utilizate",
@@ -150,7 +149,7 @@ def is_boundary_line(nln: str) -> bool:
         return True
     return False
 
-# ---------------- Core parsing ----------------
+# ---------------- Core block parsing (parts/fees) ----------------
 
 def parse_block(block_lines: List[str], default_currency: str) -> Optional[Dict[str, Any]]:
     if not block_lines:
@@ -184,13 +183,13 @@ def parse_block(block_lines: List[str], default_currency: str) -> Optional[Dict[
 
     kind = guess_kind(desc)
 
-    # numbers from rest of block
+    # numbers from rest of block (avoid "set 12" poisoning)
     rest = normalize_text("\n".join(block_lines[1:])) if len(block_lines) > 1 else ""
     nums: List[float] = []
     if rest:
         nums = [float(x) for x in NUM_RE.findall(rest)]
 
-    # qty for parts: first numeric-only line that looks like qty
+    # qty from numeric-only lines (0.001..100)
     qty = None
     for ln in block_lines[1:]:
         nln = normalize_line(ln)
@@ -203,7 +202,6 @@ def parse_block(block_lines: List[str], default_currency: str) -> Optional[Dict[
     unit_price = None
     line_total = None
 
-    # parts/fees: last two numbers are usually unit_price + total
     if len(nums) >= 1:
         line_total = nums[-1]
     if len(nums) >= 2:
@@ -247,6 +245,8 @@ def parse_block(block_lines: List[str], default_currency: str) -> Optional[Dict[
         "warnings": warnings,
     }
 
+# ---------------- Total extraction ----------------
+
 def extract_total(text: str, currency_default: str) -> Optional[Dict[str, Any]]:
     lines = [normalize_line(x) for x in (text or "").split("\n") if x is not None]
 
@@ -274,7 +274,10 @@ def extract_total(text: str, currency_default: str) -> Optional[Dict[str, Any]]:
         if ID_TAG_RE.search(ln) or ln.startswith("id:"):
             continue
         for x in NUM_RE.findall(ln):
-            n = float(x)
+            try:
+                n = float(x)
+            except Exception:
+                continue
             if 1.0 <= n <= 100000:
                 nums_tail.append(n)
 
@@ -282,17 +285,9 @@ def extract_total(text: str, currency_default: str) -> Optional[Dict[str, Any]]:
         return None
     return {"total": max(nums_tail), "currency": currency_default}
 
-# ---------------- Labor section parser ----------------
+# ---------------- Labor section parser (UPDATED) ----------------
 
 def parse_labor_section(clean_lines: List[str], default_currency: str) -> List[Dict[str, Any]]:
-    """
-    Handles OCR where labor descriptions appear first, and numeric rows appear later.
-    We:
-      - collect labor descriptions (lines starting with 'manopera ')
-      - collect numeric-only lines after labor table headers
-      - build triplets (qty, unit_price, total) using greedy consistency (qty*unit_price ~= total)
-      - assign in order to descriptions
-    """
     nlines = [normalize_line(x) for x in clean_lines]
 
     # find "manopera" section start
@@ -301,7 +296,7 @@ def parse_labor_section(clean_lines: List[str], default_currency: str) -> List[D
     except StopIteration:
         return []
 
-    # labor descriptions appear after "manopera" and after one/two header lines
+    # collect labor descriptions until ID/subtotal
     labor_descs: List[str] = []
     i = start_idx + 1
     while i < len(nlines):
@@ -312,7 +307,6 @@ def parse_labor_section(clean_lines: List[str], default_currency: str) -> List[D
             i += 1
             continue
 
-        # stop collecting desc when we hit ID/subtotal (in your OCR, ID appears before numbers)
         if ln.startswith("id:") or "subtotal" in ln:
             break
 
@@ -321,76 +315,78 @@ def parse_labor_section(clean_lines: List[str], default_currency: str) -> List[D
 
         i += 1
 
-    # collect numeric-only lines after headers; in your OCR they come AFTER "U/M Cantitate Pret..."
+    # collect numeric-only values after that point
     numeric_vals: List[float] = []
     for j in range(i, len(nlines)):
         ln = nlines[j].strip()
         if NUM_ONLY_RE.match(ln):
-            v = float(ln)
+            try:
+                v = float(ln)
+            except Exception:
+                continue
             if 0 < v <= 100000:
                 numeric_vals.append(v)
 
-        # stop if we reached "total cu tva" or footer-ish
         if "total cu tva" in ln:
             break
 
-    # find exactly as many triplets as we have labor descriptions
-target = len(labor_descs)
-triplets: List[Tuple[float, float, float]] = []
+    # UPDATED: find exactly N triplets (N = number of labor lines)
+    target = len(labor_descs)
+    triplets: List[Tuple[float, float, float]] = []
 
-k = 0
-while k < len(numeric_vals) and len(triplets) < target:
-    found = False
+    k = 0
+    while k < len(numeric_vals) and len(triplets) < target:
+        found = False
 
-    # try to match a triplet starting at/after k
-    for a in range(k, min(k + 6, len(numeric_vals))):
-        qty = numeric_vals[a]
-        if not (0.001 <= qty <= 100):
-            continue
-
-        for b in range(a + 1, min(a + 8, len(numeric_vals))):
-            unit_price = numeric_vals[b]
-            if not (0.01 <= unit_price <= 10000):
+        for a in range(k, min(k + 6, len(numeric_vals))):
+            qty = numeric_vals[a]
+            if not (0.001 <= qty <= 100):
                 continue
 
-            for c in range(b + 1, min(b + 8, len(numeric_vals))):
-                total = numeric_vals[c]
-                if total <= 0:
+            for b in range(a + 1, min(a + 8, len(numeric_vals))):
+                unit_price = numeric_vals[b]
+                if not (0.01 <= unit_price <= 10000):
                     continue
 
-                calc = qty * unit_price
-                if abs(calc - total) <= max(1.0, 0.05 * total):
-                    triplets.append((qty, unit_price, total))
-                    k = c + 1
-                    found = True
-                    break
+                for c in range(b + 1, min(b + 8, len(numeric_vals))):
+                    total = numeric_vals[c]
+                    if total <= 0:
+                        continue
 
+                    calc = qty * unit_price
+                    if abs(calc - total) <= max(1.0, 0.05 * total):
+                        triplets.append((qty, unit_price, total))
+                        k = c + 1
+                        found = True
+                        break
+
+                if found:
+                    break
             if found:
                 break
-        if found:
-            break
 
-    if not found:
-        k += 1
+        if not found:
+            k += 1
 
     items: List[Dict[str, Any]] = []
     for idx, desc_raw in enumerate(labor_descs):
         desc_norm = normalize_line(desc_raw)
-        kind = "labor"
         qty = None
         unit_price = None
         line_total = None
+
         if idx < len(triplets):
             qty, unit_price, line_total = triplets[idx]
 
-        warnings = []
+        warnings: List[str] = []
         confidence = {"qty": 0.0, "unit": 0.0, "unit_price": 0.0, "line_total": 0.0}
+
         if qty is not None:
-            confidence["qty"] = 0.8
+            confidence["qty"] = 0.85
         if unit_price is not None:
-            confidence["unit_price"] = 0.8
+            confidence["unit_price"] = 0.85
         if line_total is not None:
-            confidence["line_total"] = 0.8
+            confidence["line_total"] = 0.85
 
         if qty is None or unit_price is None or line_total is None:
             warnings.append("missing_fields")
@@ -398,9 +394,9 @@ while k < len(numeric_vals) and len(triplets) < target:
         items.append({
             "raw": desc_raw,
             "desc": desc_norm.replace("manopera ", "").strip(),
-            "kind": kind,
+            "kind": "labor",
             "qty": qty,
-            "unit": "ore",  # default for labor
+            "unit": "ore",
             "unit_price": unit_price,
             "line_total": line_total,
             "currency": default_currency,
@@ -426,10 +422,10 @@ def parse(payload: InputPayload):
             continue
         cleaned_lines.append(ln)
 
-    # 1) parse labor section (handles your OCR style)
+    # labor section parsing
     labor_items = parse_labor_section(cleaned_lines, default_currency)
 
-    # 2) parse blocks for parts/fees (generic)
+    # generic blocks (parts/fees). skip labor lines here
     blocks: List[List[str]] = []
     current: List[str] = []
 
@@ -442,16 +438,11 @@ def parse(payload: InputPayload):
     for ln in cleaned_lines:
         nln = normalize_line(ln)
 
-        # boundaries split blocks (and avoid contaminating items)
         if is_boundary_line(nln):
             flush()
             continue
 
-        # skip labor lines here (we already parsed labor section)
-        if nln.startswith("manopera "):
-            flush()
-            continue
-        if nln.strip() == "manopera":
+        if nln.strip() == "manopera" or nln.startswith("manopera "):
             flush()
             continue
 
@@ -467,12 +458,9 @@ def parse(payload: InputPayload):
     items: List[Dict[str, Any]] = []
     for b in blocks:
         parsed = parse_block(b, default_currency)
-        if parsed:
-            # ignore labor from generic blocks
-            if parsed.get("kind") != "labor":
-                items.append(parsed)
+        if parsed and parsed.get("kind") != "labor":
+            items.append(parsed)
 
-    # merge
     items.extend(labor_items)
 
     totals = extract_total(payload.ocr_text, default_currency)
