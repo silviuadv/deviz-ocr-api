@@ -34,20 +34,38 @@ def is_header_or_noise(line: str) -> bool:
     # elimina chestii tip "DEVIZ", "CLIENT", "CUI", "DATA", etc
     noise_keywords = [
         "deviz", "factura", "client", "cui", "nr", "data", "adresa",
-        "telefon", "email", "total", "subtotal", "tva", "serie", "numar",
+        "telefon", "email", "subtotal", "tva", "serie", "numar",
     ]
+
+    # footer/header frecvent in OCR-uri (autodeviz, pagini, branduri, etc.)
+    footer_noise = [
+        "generat cu", "autodeviz", "produs al", "vega", "vega web", "vega webs",
+        "web", "www", "http", "https",
+        "pagina", "page",
+        "semnatura", "stampila",
+        "cont", "iban", "banca",
+    ]
+
+    # daca linia contine marcatori foarte specifici de footer, o tai direct
+    if any(k in line for k in footer_noise):
+        return True
+
     if len(line) < 3:
         return True
+
     # daca linia are foarte putine litere si multe simboluri, e suspect
     letters = sum(ch.isalpha() for ch in line)
     if letters <= 1 and len(line) < 10:
         return True
+
     # nu o tai daca pare item (are unitati/preturi)
     if any(u in line for u in ["buc", "ore", "ora", "h", "pcs", "lei", "ron", "eur", "euro"]):
         return False
-    # header simplu
+
+    # header simplu: are keyword, dar nu are cifre
     if any(k in line for k in noise_keywords) and not any(ch.isdigit() for ch in line):
         return True
+
     return False
 
 # detectii
@@ -133,6 +151,10 @@ def parse_item_line(line: str, default_currency: str) -> Optional[Dict[str, Any]
     if len(nums) >= 2:
         unit_price = nums[-2]
 
+    # Guardrail: sume absurde (OCR/parse gresit)
+    if line_total is not None and line_total > 100000:
+        return None
+
     # daca avem qty si unit_price, putem verifica totalul
     warnings = []
     confidence = {"qty": 0.0, "unit": 0.0, "unit_price": 0.0, "line_total": 0.0}
@@ -157,6 +179,10 @@ def parse_item_line(line: str, default_currency: str) -> Optional[Dict[str, Any]
 
     # filtreaza fals-positive: daca desc e prea scurt si avem doar 1 numar, probabil nu e item
     if len(desc) < 3 and len(nums) <= 1:
+        return None
+
+    # Daca nu pare item (fara cantitate/unitate/pret) si e "unknown", ignora
+    if kind == "unknown" and qty is None and unit is None and unit_price is None:
         return None
 
     # sanity checks
