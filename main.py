@@ -1,9 +1,10 @@
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-app = FastAPI(title="Deviz OCR Parser Universal 2.0")
+app = FastAPI(title="Deviz OCR Normalizer (zipper)")
 
 # ---------------- Models ----------------
 
@@ -11,263 +12,561 @@ class Vehicle(BaseModel):
     brand: Optional[str] = None
     model: Optional[str] = None
     engine: Optional[str] = None
+    year_range: Optional[str] = None
 
 class InputPayload(BaseModel):
     vin: str
     vehicle: Optional[Vehicle] = None
     ocr_text: str
 
-class ExtractedItem(BaseModel):
-    type: str  # "manopera", "part"
-    description: str
-    qty: float
-    unit: str
-    unit_price: float
-    line_total: float
-    confidence: float
+# ---------------- Normalization ----------------
 
-class ParseResponse(BaseModel):
-    detected_type: str
-    totals: Optional[Dict[str, Any]]
-    items: List[ExtractedItem]
-    warnings: List[str]
-
-# ---------------- Helpers & Regex ----------------
-
-# Detect numbers (floats)
-NUM_RE = re.compile(r"(?<!\S)\d+(?:\.\d+)?(?!\S)") 
-CURRENCY_RE = re.compile(r"\b(ron|lei|eur|euro)\b", re.IGNORECASE)
+def clean_text(s: str) -> str:
+    s = (s or "").replace("\t", " ").replace("\u00a0", " ")
+    s = re.sub(r"[ ]{2,}", " ", s)
+    return s.strip()
 
 def normalize_text(s: str) -> str:
-    """Standardize punctuation (1.200,00 -> 1200.00)."""
-    s = (s or "").strip().replace("\t", " ")
-    # remove thousands separators
+    s = clean_text(s).lower()
+    # 2,142.00 -> 2142.00 (remove thousands commas)
     s = re.sub(r"(?<=\d),(?=\d{3}\b)", "", s)
-    s = re.sub(r"(?<=\d)\.(?=\d{3}\b)", "", s)
-    # comma decimal to dot
+    # 1,50 -> 1.50
     s = re.sub(r"(\d),(\d)", r"\1.\2", s)
     return s
 
-def extract_floats(line: str) -> List[float]:
-    return [float(x) for x in NUM_RE.findall(normalize_text(line))]
+def normalize_line(s: str) -> str:
+    return normalize_text(s)
 
-def is_garbage_line(line: str) -> bool:
-    """Filters out headers, footers, metadata."""
-    l = line.lower().strip()
-    if len(l) < 2: return True
-    # Keywords found in headers/footers of your examples
+def has_letters(s: str, n: int = 3) -> bool:
+    return sum(ch.isalpha() for ch in (s or "")) >= n
+
+def is_all_capsish(raw: str) -> bool:
+    raw = (raw or "").strip()
+    letters = [c for c in raw if c.isalpha()]
+    if len(letters) < 6:
+        return False
+    return raw == raw.upper()
+
+# ---------------- Regex ----------------
+
+CURRENCY_RE = re.compile(r"\b(ron|lei|eur|euro)\b", re.IGNORECASE)
+UNIT_RE = re.compile(r"\b(buc|buc\.|pcs|ore|ora|h|km|l|ml)\b", re.IGNORECASE)
+
+NUM_RE = re.compile(r"(?<!\w)(\d+(?:\.\d{1,4})?)(?!\w)")
+NUM_ONLY_RE = re.compile(r"^\s*\d+(?:\.\d{1,4})?\s*$")
+
+DATE_RE = re.compile(r"\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b")
+HG_RE = re.compile(r"\bhg\s*\d+\s*/\s*\d+\b", re.IGNORECASE)
+
+PART_CODE_RE = re.compile(r"^[a-z0-9]{6,}$", re.IGNORECASE)
+
+TOTAL_DEVIZ_RE = re.compile(r"\b(total\s*deviz)\b", re.IGNORECASE)
+TOTAL_CU_TVA_RE = re.compile(r"\b(total\s*cu\s*tva)\b", re.IGNORECASE)
+TOTAL_DE_PLATA_RE = re.compile(r"\b(total\s*(de\s*plata|general))\b", re.IGNORECASE)
+TOTAL_GENERIC_RE = re.compile(r"\btotal\b", re.IGNORECASE)
+
+# ---------------- Core helpers ----------------
+
+def detect_currency(text: str) -> str:
+    hits = CURRENCY_RE.findall(text or "")
+    if not hits:
+        return "unknown"
+    hits = [h.lower() for h in hits]
+    if "eur" in hits or "euro" in hits:
+        if "ron" in hits or "lei" in hits:
+            return "mixed"
+        return "EUR"
+    return "RON"
+
+def guess_kind(desc: str) -> str:
+    desc = (desc or "")
+    labor_k = ["manopera", "labor", "diagnoza", "diagnostic", "verificare", "reparatie", "montare", "caroserie"]
+    fee_k = ["taxa", "consumabile", "transport", "ecotaxa", "service"]
+    part_k = ["filtru", "ulei", "placute", "disc", "kit", "buj", "piesa", "garnitura", "curea", "pompa", "senzor",
+              "acumulator", "agrafe", "accesorii", "frana", "ambreiaj", "carcasa", "buson", "capac"]
+    if any(k in desc for k in labor_k):
+        return "labor"
+    if any(k in desc for k in fee_k):
+        return "fee"
+    if any(k in desc for k in part_k):
+        return "part"
+    return "unknown"
+
+def is_noise_line(n: str) -> bool:
+    """
+    NOTE: numeric-only lines are NOT noise (they are qty/price lines in model 2)
+    """
+    if NUM_ONLY_RE.match(n or ""):
+        return False
+
+    n = (n or "")
+    if not n.strip():
+        return True
+
+    # drop legal paragraphs, dates, etc
+    if HG_RE.search(n):
+        return True
+    if DATE_RE.search(n) and not TOTAL_GENERIC_RE.search(n):
+        return True
+
+    # strong junk phrases
     junk = [
-        "c.i.f", "j40", "adresa", "telefon", "pagina", "data:", "numar:", 
-        "midsoft", "bucuresti", "valoare", "cantitate", "pret", "u.m.", 
-        "comanda", "deviz", "semnatura", "lucrarile", "garantie", "total",
-        "factura", "aaa 2012", "popescu", "service auto"
+        "c.i.f", "cif", "nr ord reg com", "registru", "judet:", "adresa:", "telefon:",
+        "date client", "date produs", "serie de sasiu", "numar inmatriculare",
+        "piese si subansamble", "defectiune", "timp estimativ", "alte obs", "piese furnizate de client",
+        "lucrarile au fost", "perioada de garantie", "au fost efectuate de",
+        "pagina", "comanda / deviz", "numar: dvz",
+        "midsoft", "municipiul", "bucuresti",
+        "generat cu", "autodeviz", "produs al", "semnatura", "stampila",
     ]
-    if any(k in l for k in junk): return True
+    if any(k in n for k in junk):
+        return True
+
+    # table headers
+    headers = {
+        "lista materiale necesare:",
+        "lista operatiuni necesare:",
+        "nr.cod produs",
+        "nr. cod produs denumire materiale",
+        "denumire materiale",
+        "u.m. cantitate",
+        "u/m", "u.m", "cantitate", "pret", "valoare",
+        "pret lista", "pret deviz", "fara tva", "red", "%", "tva",
+        "materiale/piese", "manopera",
+    }
+    if n.strip() in headers:
+        return True
+
     return False
 
-# ---------------- ENGINE 1: COLUMN STREAM (Deviz 2 - Colt) ----------------
-# Logic: Collect all Descriptions -> Collect all Numbers -> Match them sequentially
+# ---------------- Total extraction ----------------
 
-def parse_colt_deviz_v2(lines: List[str]) -> List[ExtractedItem]:
-    items = []
-    
-    # 1. Segment text into sections based on headers
-    section_map = {"parts": [], "labor": []}
-    current_key = None
-    
-    for line in lines:
-        l_low = line.lower()
-        if "lista materiale" in l_low:
-            current_key = "parts"
+def extract_total(text: str, currency_default: str) -> Optional[Dict[str, Any]]:
+    lines_raw = (text or "").split("\n")
+    lines = [normalize_line(x) for x in lines_raw]
+
+    def get_number_near(i: int) -> Optional[float]:
+        nums = [float(x) for x in NUM_RE.findall(lines[i])]
+        if nums:
+            return nums[-1]
+        for j in range(1, 4):
+            if i + j < len(lines):
+                nxt = lines[i + j].strip()
+                if not nxt:
+                    continue
+                if HG_RE.search(nxt):
+                    continue
+                nums2 = [float(x) for x in NUM_RE.findall(nxt)]
+                if nums2:
+                    return nums2[-1]
+        return None
+
+    candidates: List[Tuple[int, int, float]] = []
+    for i, ln in enumerate(lines):
+        if not ln:
             continue
-        elif "lista operatiuni" in l_low:
-            current_key = "labor"
+        score = None
+        if TOTAL_DEVIZ_RE.search(ln):
+            score = 100
+        elif TOTAL_CU_TVA_RE.search(ln):
+            score = 95
+        elif TOTAL_DE_PLATA_RE.search(ln):
+            score = 90
+        elif TOTAL_GENERIC_RE.search(ln):
+            score = 10
+        if score is None:
             continue
-        elif "total" in l_low and "deviz" in l_low:
-            current_key = None # End parsing
-            
-        if current_key:
-            section_map[current_key].append(line)
+        val = get_number_near(i)
+        if val is None:
+            continue
+        if val <= 0 or val > 1_000_000:
+            continue
+        candidates.append((score, i, val))
 
-    # 2. Processor function for a section
-    def process_section(section_lines, kind):
-        descs = []
-        nums = []
-        
-        for line in section_lines:
-            if is_garbage_line(line):
-                continue
-                
-            # Clean generic index numbers "1.", "2." at start of line
-            clean_line = re.sub(r"^\d+\.\s*", "", line).strip()
-            
-            # Extract numbers from line
-            found_nums = extract_floats(clean_line)
-            
-            if found_nums:
-                # If line is JUST numbers (or mostly numbers), add to num queue
-                nums.extend(found_nums)
-            elif len(clean_line) > 3:
-                # Text line
-                descs.append(clean_line)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    return {"total": candidates[0][2], "currency": currency_default}
 
-        # 3. Match Logic (The "Zipper")
-        # For 'parts', OCR output implies format: Qty, Price, Total (3 nums per item)
-        # For 'labor', OCR output implies: Qty, Price (sometimes Total is far away or mixed)
-        
-        num_step = 3 if kind == "part" else 3 # Trying 3 for labor too based on your OCR
-        
-        limit = min(len(descs), len(nums) // num_step)
-        
-        section_items = []
-        for i in range(limit):
-            # Take next chunk of numbers
-            chunk = nums[i*num_step : (i+1)*num_step]
-            
-            # Logic for Colt format: Qty is usually first small number, Price is bigger
-            # Example Material: 1.00, 100.00, 100.00
-            qty = chunk[0]
-            price = chunk[1]
-            total = chunk[2] if len(chunk) > 2 else qty * price
-            
-            # Correction for Labor if order is flipped or 'h' confused things
-            # In your OCR: 3.00 90.00 (Total 270 is elsewhere sometimes). 
-            # But let's assume standard triplet if available.
-            
-            section_items.append(ExtractedItem(
-                type=kind,
-                description=descs[i],
-                qty=qty,
-                unit="buc" if kind == "part" else "ore",
-                unit_price=price,
-                line_total=total,
-                confidence=0.85
-            ))
-        return section_items
+# ---------------- Section helpers ----------------
 
-    items.extend(process_section(section_map["parts"], "part"))
-    items.extend(process_section(section_map["labor"], "manopera"))
-    
+def split_section(lines: List[str], start_contains: str, end_contains_any: List[str]) -> List[str]:
+    n = [normalize_line(x) for x in lines]
+    start = None
+    for i, ln in enumerate(n):
+        if start_contains in ln:
+            start = i
+            break
+    if start is None:
+        return []
+
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        for ep in end_contains_any:
+            if ep in n[j]:
+                end = j
+                return lines[start:end]
+    return lines[start:end]
+
+# ---------------- Zippering (model 2) ----------------
+
+def zipper_group_numbers(nums: List[float]) -> List[Tuple[float, float, float]]:
+    triples: List[Tuple[float, float, float]] = []
+    for i in range(0, len(nums), 3):
+        if i + 2 >= len(nums):
+            break
+        triples.append((nums[i], nums[i + 1], nums[i + 2]))
+    return triples
+
+def normalize_desc_for_storage(raw_desc: str) -> str:
+    d = normalize_line(raw_desc)
+    d = CURRENCY_RE.sub(" ", d)
+    d = UNIT_RE.sub(" ", d)
+    d = NUM_RE.sub(" ", d)
+    d = re.sub(r"\s{2,}", " ", d).strip(" -;:/")
+    return d
+
+def parse_material_table_zip(section_lines: List[str]) -> List[Dict[str, Any]]:
+    """
+    Works for model 2:
+      - collects descriptions
+      - collects numeric-only lines
+      - zips description[i] with triples[i] (qty, price, total)
+    Handles multi-line descriptions like "arc ambreiaj..." by attaching as continuation.
+    """
+    descs: List[str] = []
+    nums: List[float] = []
+    pending: Optional[str] = None
+
+    for raw in section_lines:
+        nr = normalize_line(raw)
+        if not nr:
+            continue
+
+        # stop if we hit next sections/totals
+        if "lista operatiuni necesare" in nr or "total deviz" in nr or "total materiale" in nr or "total manopera" in nr:
+            break
+
+        # skip headers
+        if any(k in nr for k in ["denumire materiale", "nr.cod produs", "u.m", "cantitate", "pret", "valoare", "comanda / deviz"]):
+            continue
+
+        # numbers
+        if NUM_ONLY_RE.match(nr):
+            nums.append(float(nr))
+            continue
+
+        # ignore junk
+        if is_noise_line(nr):
+            continue
+
+        # continuation line (not ALL CAPS) -> append to previous desc
+        if pending and has_letters(raw, 3) and (not is_all_capsish(raw)):
+            pending = clean_text(pending + " " + raw)
+            continue
+
+        # new desc
+        if has_letters(raw, 3):
+            if pending:
+                descs.append(pending)
+            pending = clean_text(raw)
+
+    if pending:
+        descs.append(pending)
+
+    triples = zipper_group_numbers(nums)
+    n = min(len(descs), len(triples))
+
+    items: List[Dict[str, Any]] = []
+    for i in range(n):
+        qty, unit_price, line_total = triples[i]
+        raw_desc = descs[i]
+        desc = normalize_desc_for_storage(raw_desc)
+
+        warnings: List[str] = []
+        calc = qty * unit_price
+        if abs(calc - line_total) > max(1.0, 0.05 * line_total):
+            warnings.append(f"inconsistent_total: qty*unit_price={calc:.2f} vs total={line_total:.2f}")
+
+        items.append({
+            "raw": clean_text(raw_desc),
+            "desc": desc,
+            "kind": "part",
+            "qty": qty,
+            "unit": "buc",  # model 2 materials are typically pieces; you can set None if you prefer
+            "unit_price": unit_price,
+            "line_total": line_total,
+            "currency": "unknown",
+            "confidence_fields": {"qty": 0.9, "unit": 0.4, "unit_price": 0.9, "line_total": 0.9},
+            "warnings": warnings,
+        })
     return items
 
-# ---------------- ENGINE 2: MIXED ROW (Deviz 3 - Surubelnita) ----------------
-# Logic: Split row by detected number clusters
+def parse_labor_table_zip(section_lines: List[str]) -> List[Dict[str, Any]]:
+    """
+    For model 2 labor:
+      descs: lines containing "Manopera ..."
+      nums: numeric-only lines after the table header (qty, price, total) repeating
+    """
+    descs: List[str] = []
+    nums: List[float] = []
+    started = False
 
-def parse_surubelnita_deviz(lines: List[str]) -> List[ExtractedItem]:
-    items = []
-    active = False
-    
-    for raw in lines:
-        line = normalize_text(raw)
-        if "lucrari convenite" in line.lower(): active = True; continue
-        if "total manopera" in line.lower(): active = False; break
-        if not active or "operatie" in line.lower(): continue
-        
-        nums = extract_floats(line)
-        if len(nums) < 2: continue
-        
-        # Left Side (Labor): Text ... Time(0.3) ... Price(12)
-        match_num = NUM_RE.search(line)
-        if match_num:
-            text_part = line[:match_num.start()].strip()
-            # Clean Code
-            parts = text_part.split()
-            desc = text_part
-            if parts and parts[0].isdigit(): desc = " ".join(parts[1:])
-            
-            labor_qty = nums[0]
-            labor_val = nums[1]
-            labor_price = round(labor_val/labor_qty, 2) if labor_qty else 0
-            
-            items.append(ExtractedItem(
-                type="manopera", description=desc, qty=labor_qty, unit="ore",
-                unit_price=labor_price, line_total=labor_val, confidence=0.9
-            ))
-            
-            # Right Side (Material): If 3+ numbers remain (Qty, Price, Total)
-            if len(nums) >= 5:
-                mat_qty = nums[-3]
-                mat_price = nums[-2]
-                mat_total = nums[-1]
-                
-                # Regex extract desc between Labor Val and Mat Qty
-                patt = re.compile(rf"{re.escape(str(labor_val))}\s+(.+?)\s+{re.escape(str(mat_qty))}")
-                m = patt.search(line)
-                if m:
-                    mat_desc = m.group(1).replace("buc", "").replace("ltr", "").strip()
-                    items.append(ExtractedItem(
-                        type="part", description=mat_desc, qty=mat_qty, unit="buc",
-                        unit_price=mat_price, line_total=mat_total, confidence=0.8
-                    ))
+    for raw in section_lines:
+        nr = normalize_line(raw)
+        if not nr:
+            continue
+
+        if "total deviz" in nr or "total materiale" in nr or "total manopera" in nr:
+            break
+
+        # detect table header, then start collecting nums
+        if ("u.m" in nr and "cantitate" in nr and "pret" in nr and "valoare" in nr) or ("u.m" in nr and "cantitate" in nr and "pret" in nr):
+            started = True
+            continue
+
+        if is_noise_line(nr):
+            continue
+
+        if "manopera" in nr and has_letters(raw, 3):
+            descs.append(clean_text(raw))
+            continue
+
+        if started and NUM_ONLY_RE.match(nr):
+            nums.append(float(nr))
+
+    triples = zipper_group_numbers(nums)
+    n = min(len(descs), len(triples))
+
+    items: List[Dict[str, Any]] = []
+    for i in range(n):
+        qty, unit_price, line_total = triples[i]
+        raw_desc = descs[i]
+        desc = normalize_desc_for_storage(raw_desc.replace("manopera", "").strip())
+
+        warnings: List[str] = []
+        calc = qty * unit_price
+        if abs(calc - line_total) > max(1.0, 0.05 * line_total):
+            warnings.append(f"inconsistent_total: qty*unit_price={calc:.2f} vs total={line_total:.2f}")
+
+        items.append({
+            "raw": clean_text(raw_desc),
+            "desc": desc,
+            "kind": "labor",
+            "qty": qty,
+            "unit": "ore",
+            "unit_price": unit_price,
+            "line_total": line_total,
+            "currency": "unknown",
+            "confidence_fields": {"qty": 0.9, "unit": 0.8, "unit_price": 0.9, "line_total": 0.9},
+            "warnings": warnings,
+        })
     return items
 
-# ---------------- ENGINE 3: GENERIC BLOCK (Deviz 1 - Standard) ----------------
-# Logic: Line = Text ... Qty ... Price ... Total
+def parse_model2_zip(all_lines: List[str], default_currency: str) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
 
-def parse_generic_deviz(lines: List[str]) -> List[ExtractedItem]:
-    items = []
-    current_type = "part"
-    
-    for raw in lines:
-        line = normalize_text(raw)
-        if "manopera" in line.lower() and "subtotal" not in line.lower(): current_type = "manopera"
-        
-        nums = extract_floats(line)
-        if len(nums) >= 3:
-            total = nums[-1]
-            price = nums[-2]
-            qty = nums[-3]
-            
-            # Validation logic
-            if abs((qty * price) - total) < 2.0:
-                # Valid line
-                match = re.search(rf"(.*?)\s+{re.escape(str(qty))}", line)
-                if match:
-                    desc = match.group(1).strip()
-                    # Clean Code "5NU..."
-                    parts = desc.split()
-                    if len(parts) > 1 and len(parts[0]) > 4 and any(c.isdigit() for c in parts[0]):
-                        desc = " ".join(parts[1:])
-                    
-                    items.append(ExtractedItem(
-                        type=current_type, description=desc, qty=qty, unit="buc" if current_type=="part" else "ore",
-                        unit_price=price, line_total=total, confidence=0.75
-                    ))
-    return items
-
-# ---------------- MAIN API ----------------
-
-@app.post("/parse", response_model=ParseResponse)
-def parse_deviz_endpoint(payload: InputPayload):
-    text = payload.ocr_text
-    lines = text.split('\n')
-    
-    # 1. Detect Type
-    if "service auto la colt" in text.lower() or "lista materiale necesare" in text.lower():
-        detected = "deviz_2_colt"
-        items = parse_colt_deviz_v2(lines)
-    elif "lucrari convenite" in text.lower():
-        detected = "deviz_3_surubelnita"
-        items = parse_surubelnita_deviz(lines)
-    else:
-        detected = "deviz_1_standard"
-        items = parse_generic_deviz(lines)
-        
-    # 2. Extract Total Document Value
-    total_val = 0.0
-    for line in lines:
-        if "total" in line.lower() and ("deviz" in line.lower() or "general" in line.lower()):
-            nums = extract_floats(line)
-            if nums: total_val = nums[-1]
-            
-    warnings = []
-    calc_sum = sum(i.line_total for i in items)
-    if total_val > 0 and abs(calc_sum - total_val) > 5.0:
-        warnings.append(f"Total mismatch: Sum items ({calc_sum}) != Doc Total ({total_val})")
-
-    return ParseResponse(
-        detected_type=detected,
-        totals={"amount": total_val, "currency": "RON"},
-        items=items,
-        warnings=warnings
+    mat_section = split_section(
+        all_lines,
+        start_contains="lista materiale necesare",
+        end_contains_any=["lista operatiuni necesare", "total deviz", "total materiale", "total manopera"],
     )
+    mat_items = parse_material_table_zip(mat_section)
+    for it in mat_items:
+        it["currency"] = default_currency
+    items.extend(mat_items)
+
+    op_section = split_section(
+        all_lines,
+        start_contains="lista operatiuni necesare",
+        end_contains_any=["total deviz", "total materiale", "total manopera"],
+    )
+    op_items = parse_labor_table_zip(op_section)
+    for it in op_items:
+        it["currency"] = default_currency
+    items.extend(op_items)
+
+    return items
+
+# ---------------- Model 1 (block) parsing ----------------
+
+def looks_like_item_start_model1(line: str) -> bool:
+    line = (line or "").strip()
+    if not line:
+        return False
+    n = normalize_line(line)
+
+    # part code at start (e.g. 5NU0QVAHL ...)
+    parts = line.split()
+    if len(parts) >= 2:
+        first = parts[0].strip(" -:;")
+        if PART_CODE_RE.match(first) and first not in {"total", "subtotal"}:
+            return True
+
+    if n.startswith("manopera "):
+        return True
+
+    return False
+
+def parse_block_model1(block_lines: List[str], default_currency: str) -> Optional[Dict[str, Any]]:
+    if not block_lines:
+        return None
+
+    raw_block = "\n".join(clean_text(x) for x in block_lines).strip()
+    if not raw_block:
+        return None
+
+    lblock = normalize_text(raw_block)
+
+    if is_noise_line(lblock):
+        return None
+
+    currency = default_currency
+
+    # unit
+    unit = None
+    mu = UNIT_RE.search(lblock)
+    if mu:
+        unit = mu.group(1).lower().replace(".", "")
+        if unit in ("ora", "h"):
+            unit = "ore"
+
+    # description from first line
+    first_line = normalize_line(block_lines[0])
+    desc = normalize_desc_for_storage(block_lines[0])
+    kind = guess_kind(desc)
+
+    # numbers from rest
+    rest = normalize_text("\n".join(block_lines[1:])) if len(block_lines) > 1 else ""
+    nums: List[float] = [float(x) for x in NUM_RE.findall(rest)] if rest else []
+
+    # qty from numeric-only lines
+    qty = None
+    for ln in block_lines[1:]:
+        nln = normalize_line(ln)
+        if NUM_ONLY_RE.match(nln):
+            v = float(nln)
+            if 0.001 <= v <= 100:
+                qty = v
+                break
+
+    unit_price = None
+    line_total = None
+    if len(nums) >= 1:
+        line_total = nums[-1]
+    if len(nums) >= 2:
+        unit_price = nums[-2]
+
+    # better: if qty and total exist, choose price closest to total/qty
+    if qty is not None and line_total is not None and nums and qty != 0:
+        target = line_total / qty
+        unit_price = min(nums, key=lambda x: abs(x - target))
+
+    # avoid absurd totals
+    if isinstance(line_total, float) and line_total > 1_000_000:
+        return None
+
+    warnings: List[str] = []
+    if qty is not None and unit_price is not None and line_total is not None and qty != 0:
+        calc = qty * unit_price
+        if abs(calc - line_total) > max(1.0, 0.05 * line_total):
+            warnings.append(f"inconsistent_total: qty*unit_price={calc:.2f} vs total={line_total:.2f}")
+    else:
+        warnings.append("missing_fields")
+
+    # skip useless garbage
+    if kind == "unknown" and "missing_fields" in warnings:
+        return None
+
+    return {
+        "raw": raw_block,
+        "desc": desc,
+        "kind": kind,
+        "qty": qty,
+        "unit": unit,
+        "unit_price": unit_price,
+        "line_total": line_total,
+        "currency": currency,
+        "confidence_fields": {"qty": 0.7 if qty is not None else 0.0,
+                              "unit": 0.7 if unit is not None else 0.0,
+                              "unit_price": 0.6 if unit_price is not None else 0.0,
+                              "line_total": 0.7 if line_total is not None else 0.0},
+        "warnings": warnings,
+    }
+
+# ---------------- API ----------------
+
+@app.post("/parse")
+def parse(payload: InputPayload):
+    default_currency = detect_currency(payload.ocr_text)
+    all_lines = (payload.ocr_text or "").split("\n")
+
+    items: List[Dict[str, Any]] = []
+
+    # A) Try zippering tables (MODEL 2). If sections exist, this gives best results.
+    items.extend(parse_model2_zip(all_lines, default_currency))
+
+    # B) Fallback block parsing (MODEL 1).
+    # Keep only useful lines or item starts.
+    cleaned_lines: List[str] = []
+    for ln in all_lines:
+        nln = normalize_line(ln)
+        if not nln:
+            continue
+        if is_noise_line(nln) and not looks_like_item_start_model1(ln):
+            continue
+        cleaned_lines.append(ln)
+
+    # Build blocks starting with item-start lines
+    blocks: List[List[str]] = []
+    current: List[str] = []
+
+    def flush():
+        nonlocal current
+        if current:
+            blocks.append(current)
+            current = []
+
+    for ln in cleaned_lines:
+        if looks_like_item_start_model1(ln):
+            flush()
+            current = [ln]
+        else:
+            if current:
+                current.append(ln)
+    flush()
+
+    for b in blocks:
+        parsed = parse_block_model1(b, default_currency)
+        if parsed:
+            items.append(parsed)
+
+    totals = extract_total(payload.ocr_text, default_currency)
+
+    line_totals = [
+        x.get("line_total")
+        for x in items
+        if isinstance(x.get("line_total"), (int, float)) and x.get("line_total") is not None and x.get("line_total") <= 1_000_000
+    ]
+    sum_guess = float(sum(line_totals)) if line_totals else None
+
+    doc_warnings: List[str] = []
+    if totals and sum_guess is not None:
+        if abs(totals["total"] - sum_guess) > max(2.0, 0.05 * totals["total"]):
+            doc_warnings.append("document_total_mismatch_vs_sum_of_lines")
+
+    return {
+        "document": {
+            "vin": payload.vin,
+            "vehicle": payload.vehicle.model_dump() if payload.vehicle else None,
+            "default_currency": default_currency,
+        },
+        "totals": totals,
+        "sum_guess_from_lines": sum_guess,
+        "items": items,
+        "warnings": doc_warnings,
+    }
+
+@app.get("/health")
+def health():
+    return {"ok": True}
