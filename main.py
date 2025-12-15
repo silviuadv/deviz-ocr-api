@@ -25,6 +25,7 @@ class DevizUrlPayload(BaseModel):
 class ExtractedItem(BaseModel):
     raw: Optional[str] = ""
     desc: str = ""
+    part_code: Optional[str] = None  # NEW: cod piesa (ex: 5NU0QVAHL, 365.372)
     kind: str = Field(default="part")  # part / labor
     qty: float = 0.0
     unit: str = ""
@@ -124,6 +125,48 @@ def _approx_equal(a: Optional[float], b: Optional[float], tol: float = 2.0) -> b
     if a is None or b is None:
         return False
     return abs(a - b) <= tol
+
+
+# =========================
+# NEW: part code extraction
+# =========================
+
+PART_CODE_RE = re.compile(
+    r"\b(?=.{4,20}\b)(?=.*[A-Z])(?=.*\d)[A-Z0-9]+(?:[.\-][A-Z0-9]+)*\b"
+)
+
+def extract_part_code(raw_line: str, desc: str, kind: str) -> Optional[str]:
+    """
+    Conservative extractor for part codes:
+    - only for kind == 'part'
+    - prefer first token if it looks like a code
+    - fallback: search in whole line
+    """
+    if (kind or "").lower() != "part":
+        return None
+
+    raw = _norm_spaces(raw_line or "")
+    if not raw:
+        raw = _norm_spaces(desc or "")
+
+    # Prefer first token if matches
+    toks = raw.split()
+    if toks:
+        t0 = toks[0].strip('"\',;:()[]{}')
+        if PART_CODE_RE.fullmatch(t0.upper()):
+            # avoid common junk tokens
+            if not t0.upper().startswith("RO"):
+                return t0.upper()
+
+    # Search whole line
+    up = raw.upper()
+    for m in PART_CODE_RE.finditer(up):
+        cand = m.group(0)
+        if cand.startswith("RO"):
+            continue
+        return cand
+
+    return None
 
 
 # =========================
@@ -239,7 +282,10 @@ def _split_tail_numbers(line: str) -> Tuple[str, List[float]]:
 def parse_generic_lines(lines: List[str], currency: str = "RON") -> List[ExtractedItem]:
     items: List[ExtractedItem] = []
 
-    noise = ["pagina", "total deviz", "total materiale", "total manopera", "lucrarile", "perioada", "certificat", "garantie"]
+    noise = [
+        "pagina", "total deviz", "total materiale", "total manopera",
+        "lucrarile", "perioada", "certificat", "garantie"
+    ]
     for line in lines:
         l = _norm_spaces(line)
         if len(l) < 4:
@@ -262,7 +308,6 @@ def parse_generic_lines(lines: List[str], currency: str = "RON") -> List[Extract
             if abs((q * p) - t) <= 2.0:
                 qty, unit_price, line_total = q, p, t
             else:
-                # if only qty+price and no total, derive
                 if len(nums) == 2:
                     line_total = qty * unit_price
 
@@ -279,9 +324,12 @@ def parse_generic_lines(lines: List[str], currency: str = "RON") -> List[Extract
         if not desc:
             continue
 
+        part_code = extract_part_code(raw_line=l, desc=desc, kind=kind)
+
         items.append(ExtractedItem(
             raw=l,
             desc=desc,
+            part_code=part_code,
             kind=kind,
             qty=float(qty or 0.0),
             unit=unit,
@@ -299,9 +347,11 @@ def parse_generic_lines(lines: List[str], currency: str = "RON") -> List[Extract
 # =========================
 
 def _detect_autodeviz_table(lines: List[str]) -> bool:
-    # typical headers: "LUCRARI CONVENITE..." and columns "OPERATIE" "Material" "Timp" "Val"
     joined = "\n".join(lines[:200]).lower()
-    return ("operatie" in joined and "material" in joined and "timp" in joined and "u.m" in joined) or ("lucrari convenite" in joined)
+    return (
+        ("operatie" in joined and "material" in joined and "timp" in joined and "u.m" in joined)
+        or ("lucrari convenite" in joined)
+    )
 
 
 def _cluster_lines_with_words(words: List[_Word]) -> List[List[_Word]]:
@@ -339,7 +389,6 @@ def _parse_autodeviz_rows(words: List[_Word], currency: str = "RON") -> List[Ext
     """
     lines_words = _cluster_lines_with_words(words)
 
-    # find header line index
     header_idx = None
     for i, lw in enumerate(lines_words):
         t = _line_text(lw).lower()
@@ -347,7 +396,6 @@ def _parse_autodeviz_rows(words: List[_Word], currency: str = "RON") -> List[Ext
             header_idx = i
             break
     if header_idx is None:
-        # fallback: find "LUCRARI CONVENITE" then next ~lines contain table
         for i, lw in enumerate(lines_words):
             t = _line_text(lw).lower()
             if "lucrari convenite" in t:
@@ -356,7 +404,6 @@ def _parse_autodeviz_rows(words: List[_Word], currency: str = "RON") -> List[Ext
     if header_idx is None:
         return []
 
-    # we parse following lines until we hit totals/footer
     items: List[ExtractedItem] = []
 
     def token_is_num(tok: str) -> bool:
@@ -379,7 +426,6 @@ def _parse_autodeviz_rows(words: List[_Word], currency: str = "RON") -> List[Ext
         if any(m in low for m in stop_markers):
             break
 
-        # must start with code like 0101 / 0036 etc OR look like a row with numbers
         tokens = text.split()
         if not tokens:
             continue
@@ -389,20 +435,9 @@ def _parse_autodeviz_rows(words: List[_Word], currency: str = "RON") -> List[Ext
         if not (starts_like_code or has_many_nums):
             continue
 
-        # Strategy: pick out numeric fields by scanning tokens left->right.
-        # For this table, typical sequence after operation words:
-        # time_h, labor_val, material_words..., qty, um, unit_price, material_val
-        #
-        # We'll:
-        # 1) identify first two numeric tokens after code as time_h and labor_val (usually small time then int val)
-        # 2) then last 4 tokens often represent qty, um, unit_price, material_val (but um is not numeric)
-        #
         code = tokens[0] if starts_like_code else ""
-
-        # remove code
         rest = tokens[1:] if starts_like_code else tokens[:]
 
-        # find first numeric = time_h, second numeric = labor_val
         num_positions = [(idx, t) for idx, t in enumerate(rest) if token_is_num(t)]
         if len(num_positions) < 2:
             continue
@@ -418,34 +453,25 @@ def _parse_autodeviz_rows(words: List[_Word], currency: str = "RON") -> List[Ext
         if not operation:
             operation = "operatie"
 
-        # now parse material tail:
-        # look from end for material_val numeric; preceding numeric is unit_price; preceding token is UM; preceding numeric is qty
         material_val = None
         unit_price = None
         qty = None
         um = ""
 
-        # scan from end
-        # pick last numeric as material_val
         tail_nums = [(idx, t) for idx, t in enumerate(rest) if token_is_num(t)]
-        # material_val is usually the last numeric on row
         if tail_nums:
             idx_mv, tok_mv = tail_nums[-1]
             material_val = tok_float(tok_mv)
 
-        # unit_price: numeric before last numeric (if exists)
         if len(tail_nums) >= 2:
             idx_up, tok_up = tail_nums[-2]
             unit_price = tok_float(tok_up)
 
-        # qty: numeric before unit_price (if exists)
         if len(tail_nums) >= 3:
             idx_q, tok_q = tail_nums[-3]
             qty = tok_float(tok_q)
 
-        # UM: token between qty and unit_price (usually right after qty)
         if qty is not None and unit_price is not None:
-            # find position of qty token in rest (last occurrence)
             qty_pos = None
             for idx, t in reversed(list(enumerate(rest))):
                 if token_is_num(t) and _approx_equal(tok_float(t), qty, tol=0.0001):
@@ -453,14 +479,11 @@ def _parse_autodeviz_rows(words: List[_Word], currency: str = "RON") -> List[Ext
                     break
             if qty_pos is not None and qty_pos + 1 < len(rest):
                 um_candidate = rest[qty_pos + 1]
-                # avoid numeric
                 if not token_is_num(um_candidate):
                     um = um_candidate
 
-        # material description: between labor_val and qty_pos (or to end if no material fields)
         mat_desc = ""
         if qty is not None:
-            # locate qty position again robustly: use first occurrence of that exact token after labor_val
             qty_pos2 = None
             for idx in range(i_lval + 1, len(rest)):
                 if token_is_num(rest[idx]) and _approx_equal(tok_float(rest[idx]), qty, tol=0.0001):
@@ -470,10 +493,8 @@ def _parse_autodeviz_rows(words: List[_Word], currency: str = "RON") -> List[Ext
                 mat_tokens = rest[i_lval + 1: qty_pos2]
                 mat_desc = _norm_spaces(" ".join(mat_tokens)).strip(' "')
         else:
-            # no material part
             mat_desc = ""
 
-        # create labor item
         labor_unit_price = 0.0
         labor_warnings: List[str] = []
         if time_h > 0 and labor_val > 0:
@@ -484,6 +505,7 @@ def _parse_autodeviz_rows(words: List[_Word], currency: str = "RON") -> List[Ext
         items.append(ExtractedItem(
             raw=text,
             desc=operation,
+            part_code=None,
             kind="labor",
             qty=float(time_h or 0.0),
             unit="ore",
@@ -493,16 +515,17 @@ def _parse_autodeviz_rows(words: List[_Word], currency: str = "RON") -> List[Ext
             warnings=labor_warnings
         ))
 
-        # create material item if present and qty+unit_price+material_val look valid and mat_desc not empty
         if mat_desc and qty is not None and unit_price is not None and material_val is not None:
             part_warnings: List[str] = []
-            # verify math
             if abs((qty * unit_price) - material_val) > 2.0:
                 part_warnings.append("derived_unit_price_or_total_mismatch")
+
+            part_code = extract_part_code(raw_line=text, desc=mat_desc, kind="part")
 
             items.append(ExtractedItem(
                 raw=text,
                 desc=mat_desc,
+                part_code=part_code,
                 kind="part",
                 qty=float(qty or 0.0),
                 unit=um or "",
@@ -534,7 +557,6 @@ def _extract_totals_from_text(raw_text: str) -> Totals:
 
     totals = Totals(currency="RON")
 
-    # common Romanian totals
     totals.materials = find_money([
         r"TOTAL\s+MATERIALE\s*[:\-]?\s*([\d\.\,]+)",
         r"Total\s+materiale\s*[:\-]?\s*([\d\.\,]+)",
@@ -549,7 +571,6 @@ def _extract_totals_from_text(raw_text: str) -> Totals:
         r"Total\s+cu\s+TVA\s*[:\-]?\s*([\d\.\,]+)",
     ])
 
-    # currency
     cur = "RON"
     if "lei" in low:
         cur = "RON"
@@ -570,7 +591,6 @@ def _openai_fallback(image_bytes: bytes, raw_text: str) -> DevizResponse:
 
     model = os.getenv("OPENAI_MODEL", "gpt-4o").strip() or "gpt-4o"
 
-    # Keep schema simple + stable for Make mapping
     schema = {
         "type": "object",
         "properties": {
@@ -605,6 +625,7 @@ def _openai_fallback(image_bytes: bytes, raw_text: str) -> DevizResponse:
                     "properties": {
                         "raw": {"type": ["string", "null"]},
                         "desc": {"type": "string"},
+                        "part_code": {"type": ["string", "null"]},
                         "kind": {"type": "string"},
                         "qty": {"type": "number"},
                         "unit": {"type": "string"},
@@ -621,8 +642,6 @@ def _openai_fallback(image_bytes: bytes, raw_text: str) -> DevizResponse:
         "required": ["document", "totals", "items", "warnings"]
     }
 
-    # OpenAI Responses API (image + text)
-    # image as base64 data url
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     image_url = f"data:image/png;base64,{b64}"
 
@@ -636,6 +655,7 @@ def _openai_fallback(image_bytes: bytes, raw_text: str) -> DevizResponse:
         "- Nu inventa valori. Daca lipseste ceva, pune null sau 0 unde e numeric.\n"
         "- Pastreaza cantitatile si totalurile exact cum apar.\n"
         "- Daca un rand contine si operatie si material (tabel combinat), creeaza 2 items: unul labor (operatie) si unul part (material).\n"
+        "- Daca vezi cod de piesa (OEM/aftermarket), pune-l in part_code.\n"
     )
 
     req = {
@@ -646,7 +666,6 @@ def _openai_fallback(image_bytes: bytes, raw_text: str) -> DevizResponse:
                 "content": [
                     {"type": "input_text", "text": prompt},
                     {"type": "input_image", "image_url": image_url},
-                    # raw_text helps if image is slightly noisy
                     {"type": "input_text", "text": "OCR raw text (optional context):\n" + (raw_text or "")[:8000]},
                 ],
             }
@@ -670,7 +689,6 @@ def _openai_fallback(image_bytes: bytes, raw_text: str) -> DevizResponse:
         raise HTTPException(status_code=502, detail=f"OpenAI error: {r.text}")
 
     data = r.json()
-    # responses output text is in output[0].content[0].text typically
     out_text = None
     try:
         for o in data.get("output", []):
@@ -688,10 +706,9 @@ def _openai_fallback(image_bytes: bytes, raw_text: str) -> DevizResponse:
 
     parsed = json.loads(out_text)
 
-    # normalize into DevizResponse
     resp = DevizResponse(
-        document=DocumentMeta(**parsed.get("document", {}) or {"default_currency": "RON"}),
-        totals=Totals(**parsed.get("totals", {}) or {"currency": "RON"}),
+        document=DocumentMeta(**(parsed.get("document", {}) or {"default_currency": "RON"})),
+        totals=Totals(**(parsed.get("totals", {}) or {"currency": "RON"})),
         items=[ExtractedItem(**it) for it in (parsed.get("items") or [])],
         warnings=parsed.get("warnings") or [],
         sum_guess_from_lines=None,
@@ -716,14 +733,12 @@ def _score_result(resp: DevizResponse) -> Tuple[bool, List[str]]:
     if gt is None or gt <= 0:
         reasons.append("missing_grand_total")
 
-    # If we have both materials & labor totals, check sum
     m = resp.totals.materials
     l = resp.totals.labor
     if gt and m is not None and l is not None:
         if abs((m + l) - gt) > 10.0:
             reasons.append("totals_mismatch_gt_vs_m_plus_l")
 
-    # Also check if too many derived warnings
     warn_count = sum(1 for it in items for w in (it.warnings or []) if "derived" in w or "mismatch" in w)
     if len(items) > 0 and (warn_count / max(1, len(items))) > 0.7:
         reasons.append("too_many_derived_warnings")
@@ -733,7 +748,6 @@ def _score_result(resp: DevizResponse) -> Tuple[bool, List[str]]:
 
 
 def _build_response_from_primary(words: List[_Word], raw_text: str) -> DevizResponse:
-    currency = "RON"
     totals = _extract_totals_from_text(raw_text)
     currency = totals.currency or "RON"
 
@@ -743,7 +757,6 @@ def _build_response_from_primary(words: List[_Word], raw_text: str) -> DevizResp
     used_parser = "generic_lines"
 
     if _detect_autodeviz_table(lines):
-        # try table-aware parser first for Deviz 3 style
         items_tbl = _parse_autodeviz_rows(words, currency=currency)
         if len(items_tbl) >= 2:
             items = items_tbl
@@ -755,10 +768,8 @@ def _build_response_from_primary(words: List[_Word], raw_text: str) -> DevizResp
         items = parse_generic_lines(lines, currency=currency)
         used_parser = "generic_lines"
 
-    # sum guess from items
     sum_guess = sum((it.line_total or 0.0) for it in items) if items else None
 
-    # fill totals from items if missing
     if totals.materials is None:
         totals.materials = sum((it.line_total or 0.0) for it in items if it.kind == "part") if items else None
     if totals.labor is None:
@@ -796,7 +807,6 @@ def _process_image(image_bytes: bytes) -> DevizResponse:
     ok, reasons = _score_result(primary)
 
     threshold = float(os.getenv("FALLBACK_SCORE_THRESHOLD", "1").strip() or "1")
-    # threshold here is simple: if primary not ok -> fallback
     need_fallback = (not ok) and threshold >= 1
 
     if need_fallback:
@@ -810,7 +820,6 @@ def _process_image(image_bytes: bytes) -> DevizResponse:
         return fb
 
     if not ok:
-        # keep primary, but tell user why it might be weak
         primary.warnings = (primary.warnings or []) + ["primary_low_confidence: " + ",".join(reasons)]
 
     return primary
@@ -821,7 +830,6 @@ def _process_image(image_bytes: bytes) -> DevizResponse:
 # =========================
 
 def _download_file(url: str) -> bytes:
-    # Airtable attachment URLs are usually direct and time-limited. Use GET.
     r = requests.get(url, timeout=60)
     if r.status_code != 200:
         raise HTTPException(status_code=502, detail=f"Failed to download file: {r.status_code}")
@@ -840,7 +848,6 @@ def health():
 @app.post("/process_deviz_url", response_model=DevizResponse)
 def process_deviz_url(payload: DevizUrlPayload):
     image_bytes = _download_file(payload.url)
-    # if PDF: you can extend later; for now assume PNG/JPG
     return _process_image(image_bytes)
 
 
