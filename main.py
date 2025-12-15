@@ -2,18 +2,15 @@ import os
 import re
 import json
 import base64
-import math
 import requests
-from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 app = FastAPI(
     title="Deviz Parser Hybrid: Vision Layout Primary + GPT Fallback",
-    version="0.1.0"
+    version="0.2.0"
 )
 
 # =========================
@@ -33,8 +30,10 @@ class ExtractedItem(BaseModel):
     unit_price: float = 0.0
     line_total: float = 0.0
     currency: str = "RON"
-    part_code: Optional[str] = None  # <--- NEW: cod piesa (daca exista)
     warnings: List[str] = Field(default_factory=list)
+
+    # NEW: part/service code (optional). If not found / junk -> None
+    part_code: Optional[str] = None
 
 
 class Totals(BaseModel):
@@ -93,19 +92,18 @@ def _safe_float(x: Any) -> Optional[float]:
             if re.fullmatch(r"\d{1,3}(,\d{3})+(\.\d+)?", s):
                 s = s.replace(",", "")
                 return float(s)
-            # decimal comma: 123,45
+            # comma as decimal: 123,45
             if re.fullmatch(r"\d+,\d{1,4}", s):
                 s = s.replace(",", ".")
                 return float(s)
-            # fallback: strip commas
             s = s.replace(",", "")
             return float(s)
 
-        # Case C: only dot (normal decimal)
+        # Case C: only dot
         if "." in s and "," not in s:
             return float(s)
 
-        # Case D: plain int
+        # Case D: int
         if re.fullmatch(r"\d+", s):
             return float(s)
 
@@ -130,64 +128,118 @@ def _approx_equal(a: Optional[float], b: Optional[float], tol: float = 2.0) -> b
 
 
 # =========================
-# Part code extraction (NEW)
-# - prevents false positives like "1 2 3 4 5"
+# NEW: Part code extraction (prevents 1..5 and junk like "ambreiaj5")
 # =========================
 
-# candidate tokens like: 5NU0QVAHL, 365.372, ABC-1234, etc.
-_CODE_CANDIDATE_RE = re.compile(r"\b[A-Z0-9][A-Z0-9\.\-\/]{3,}\b", re.IGNORECASE)
+_CODE_BLACKLIST = {
+    "cod", "produs", "nr", "numar", "nume", "u.m", "um", "cantitate", "pret", "valoare",
+    "total", "manopera", "materiale", "operatie", "operatii", "lista", "pagina",
+    "dvz", "factura", "cif", "cui", "reg", "com"
+}
 
-def _is_junk_code(tok: str) -> bool:
-    t = (tok or "").strip().strip(":").strip()
+def _is_valid_part_code(tok: str) -> bool:
+    """
+    Accepts:
+      - 5NU0QVAHL (alnum, >=4, digits>=2)
+      - 1604AER (alnum, digits>=2)
+      - 365.372 (exact 3.3 digits)
+    Rejects:
+      - 1 2 3 4 5
+      - 1. / 2.
+      - ambreiaj5 (only 1 digit)
+      - plain money-like tokens, hours, etc.
+    """
+    t = (tok or "").strip().strip('",;:()[]{}')
     if not t:
-        return True
-
-    # lista/index: "1", "2", "3", "1.", "2."
-    if re.fullmatch(r"\d{1,2}\.?", t):
-        return True
-
-    # ani / numere simple gen 2019
-    if re.fullmatch(r"\d{4}", t):
-        return True
-
-    # numere mari dar doar cifre -> de obicei nu e cod piesa
-    if re.fullmatch(r"\d{3,}", t):
-        return True
-
-    # prea scurt
-    if len(t) < 5:
-        return True
-
-    # acceptam explicit coduri gen "365.372"
-    if re.fullmatch(r"\d{3}\.\d{3}", t):
         return False
 
-    # in rest: vrem cel putin o litera si o cifra
-    has_alpha = any(ch.isalpha() for ch in t)
-    has_digit = any(ch.isdigit() for ch in t)
-    if not (has_alpha and has_digit):
-        return True
+    low = t.lower()
+    if low in _CODE_BLACKLIST:
+        return False
 
-    # NEW: respingem "ambreiaj5" / cuvinte + o singura cifra
-    digit_count = sum(ch.isdigit() for ch in t)
-    if digit_count < 2:
-    # exceptie: coduri tip 365.372
+    # reject bullets like "1." "2."
+    if re.fullmatch(r"\d+\.", t):
+        return False
+
+    # reject pure digits (these are the ones that became 1..5)
+    if re.fullmatch(r"\d+", t):
+        # even if 365372 exists, it should be as 365.372 in these docs
+        return False
+
+    # accept pattern 365.372 (common from your deviz)
     if re.fullmatch(r"\d{3}\.\d{3}", t):
-            return False
         return True
-    
-    return False
+
+    # must be alnum-ish (allow dot, dash)
+    if not re.fullmatch(r"[A-Za-z0-9\.\-_/]+", t):
+        return False
+
+    digit_count = sum(ch.isdigit() for ch in t)
+    alpha_count = sum(ch.isalpha() for ch in t)
+
+    # IMPORTANT: at least 2 digits -> blocks "ambreiaj5"
+    if digit_count < 2:
+        return False
+
+    # keep reasonable length
+    if len(t) < 4:
+        return False
+
+    # if it has no letters, it’s probably numeric-ish junk
+    if alpha_count == 0:
+        return False
+
+    return True
 
 
-def _extract_part_code_from_text(text: str) -> Optional[str]:
-    if not text:
+def _extract_part_code(text: str) -> Optional[str]:
+    """
+    Extract best candidate code from a line.
+    Preference:
+      1) 3.3 digit code (365.372)
+      2) long alnum codes
+    """
+    s = _norm_spaces(text or "")
+    if not s:
         return None
-    candidates = _CODE_CANDIDATE_RE.findall(text)
+
+    # quick reject very short
+    if len(s) < 3:
+        return None
+
+    # prioritize 365.372 pattern
+    m = re.search(r"\b(\d{3}\.\d{3})\b", s)
+    if m:
+        cand = m.group(1)
+        if _is_valid_part_code(cand):
+            return cand
+
+    # then alnum candidates
+    # NOTE: this grabs "5NU0QVAHL", "1604AER", etc.
+    candidates = re.findall(r"\b[A-Za-z0-9][A-Za-z0-9\.\-_/]{3,}\b", s)
+    best = None
     for c in candidates:
-        c = c.strip().strip(":")
-        if not _is_junk_code(c):
-            return c
-    return None
+        if _is_valid_part_code(c):
+            # prefer longer / more digit-heavy slightly
+            if best is None:
+                best = c
+            else:
+                score_best = (len(best), sum(ch.isdigit() for ch in best))
+                score_c = (len(c), sum(ch.isdigit() for ch in c))
+                if score_c > score_best:
+                    best = c
+
+    return best
+
+
+def _strip_leading_code(desc: str, code: Optional[str]) -> str:
+    if not desc:
+        return desc
+    if not code:
+        return desc
+    # remove if at beginning: "5NU0QVAHL ACCESORII FRANA" -> "ACCESORII FRANA"
+    pattern = rf"^\s*{re.escape(code)}\s+"
+    return re.sub(pattern, "", desc, flags=re.IGNORECASE).strip()
 
 
 # =========================
@@ -250,7 +302,6 @@ def _extract_words_and_raw_text(vision_json: Dict[str, Any]) -> Tuple[List[_Word
                     h = max(1, yb - y)
                     if txt.strip():
                         words.append(_Word(txt, x, y, h))
-
     return words, raw_text
 
 
@@ -287,7 +338,6 @@ def reconstruct_lines_from_words(words: List[_Word]) -> List[str]:
 def _split_tail_numbers(line: str) -> Tuple[str, List[float]]:
     parts = line.split()
     nums: List[float] = []
-
     for p in reversed(parts):
         val = _safe_float(p)
         if val is None:
@@ -302,16 +352,18 @@ def parse_generic_lines(lines: List[str], currency: str = "RON") -> List[Extract
     items: List[ExtractedItem] = []
 
     noise = [
-        "pagina", "total deviz", "total materiale", "total manopera", "lucrarile",
-        "perioada", "certificat", "garantie", "factura", "c.i.f", "nr ord", "reg com"
+        "pagina", "total deviz", "total materiale", "total manopera",
+        "lucrarile", "perioada", "certificat", "garantie"
     ]
-
     for line in lines:
         l = _norm_spaces(line)
         if len(l) < 4:
             continue
         if _contains_any(l, noise):
             continue
+
+        # extract part_code from the raw line BEFORE we strip numbers
+        part_code = _extract_part_code(l)
 
         desc, nums = _split_tail_numbers(l)
         if len(nums) < 2:
@@ -336,14 +388,13 @@ def parse_generic_lines(lines: List[str], currency: str = "RON") -> List[Extract
             kind = "labor"
             unit = "ore"
             desc = re.sub(r"(?i)\bmanopera\b", "", desc).strip()
+            part_code = None  # labor does not get part_code
 
         desc = re.sub(r"^\d+\.?\s*", "", desc).strip()
+        desc = _strip_leading_code(desc, part_code)
+
         if not desc:
             continue
-
-        part_code = None
-        if kind == "part":
-            part_code = _extract_part_code_from_text(l) or _extract_part_code_from_text(desc)
 
         items.append(ExtractedItem(
             raw=l,
@@ -354,8 +405,8 @@ def parse_generic_lines(lines: List[str], currency: str = "RON") -> List[Extract
             unit_price=float(unit_price or 0.0),
             line_total=float(line_total or 0.0),
             currency=currency,
-            part_code=part_code,
-            warnings=[]
+            warnings=[],
+            part_code=part_code
         ))
 
     return items
@@ -368,7 +419,7 @@ def parse_generic_lines(lines: List[str], currency: str = "RON") -> List[Extract
 def _detect_autodeviz_table(lines: List[str]) -> bool:
     joined = "\n".join(lines[:200]).lower()
     return (
-        ("operatie" in joined and "material" in joined and "timp" in joined and "u.m" in joined)
+        ("operatie" in joined and "material" in joined and "timp" in joined)
         or ("lucrari convenite" in joined)
     )
 
@@ -447,7 +498,6 @@ def _parse_autodeviz_rows(words: List[_Word], currency: str = "RON") -> List[Ext
         if not (starts_like_code or has_many_nums):
             continue
 
-        code = tokens[0] if starts_like_code else ""
         rest = tokens[1:] if starts_like_code else tokens[:]
 
         num_positions = [(idx, t) for idx, t in enumerate(rest) if token_is_num(t)]
@@ -472,15 +522,15 @@ def _parse_autodeviz_rows(words: List[_Word], currency: str = "RON") -> List[Ext
 
         tail_nums = [(idx, t) for idx, t in enumerate(rest) if token_is_num(t)]
         if tail_nums:
-            idx_mv, tok_mv = tail_nums[-1]
+            _, tok_mv = tail_nums[-1]
             material_val = tok_float(tok_mv)
 
         if len(tail_nums) >= 2:
-            idx_up, tok_up = tail_nums[-2]
+            _, tok_up = tail_nums[-2]
             unit_price = tok_float(tok_up)
 
         if len(tail_nums) >= 3:
-            idx_q, tok_q = tail_nums[-3]
+            _, tok_q = tail_nums[-3]
             qty = tok_float(tok_q)
 
         if qty is not None and unit_price is not None:
@@ -521,8 +571,8 @@ def _parse_autodeviz_rows(words: List[_Word], currency: str = "RON") -> List[Ext
             unit_price=float(labor_unit_price or 0.0),
             line_total=float(labor_val or 0.0),
             currency=currency,
-            part_code=None,
-            warnings=labor_warnings
+            warnings=labor_warnings,
+            part_code=None
         ))
 
         if mat_desc and qty is not None and unit_price is not None and material_val is not None:
@@ -530,19 +580,20 @@ def _parse_autodeviz_rows(words: List[_Word], currency: str = "RON") -> List[Ext
             if abs((qty * unit_price) - material_val) > 2.0:
                 part_warnings.append("derived_unit_price_or_total_mismatch")
 
-            part_code = _extract_part_code_from_text(text) or _extract_part_code_from_text(mat_desc)
+            part_code = _extract_part_code(mat_desc)
+            mat_desc_clean = _strip_leading_code(mat_desc, part_code)
 
             items.append(ExtractedItem(
                 raw=text,
-                desc=mat_desc,
+                desc=mat_desc_clean,
                 kind="part",
                 qty=float(qty or 0.0),
                 unit=um or "",
                 unit_price=float(unit_price or 0.0),
                 line_total=float(material_val or 0.0),
                 currency=currency,
-                part_code=part_code,
-                warnings=part_warnings
+                warnings=part_warnings,
+                part_code=part_code
             ))
 
     return items
@@ -582,8 +633,6 @@ def _extract_totals_from_text(raw_text: str) -> Totals:
     ])
 
     cur = "RON"
-    if "eur" in low or "euro" in low:
-        cur = "EUR"
     if "lei" in low or "ron" in low:
         cur = "RON"
     totals.currency = cur
@@ -641,10 +690,10 @@ def _openai_fallback(image_bytes: bytes, raw_text: str) -> DevizResponse:
                         "unit_price": {"type": "number"},
                         "line_total": {"type": "number"},
                         "currency": {"type": "string"},
+                        "warnings": {"type": "array", "items": {"type": "string"}},
                         "part_code": {"type": ["string", "null"]},
-                        "warnings": {"type": "array", "items": {"type": "string"}}
                     },
-                    "required": ["desc", "kind", "qty", "unit", "unit_price", "line_total", "currency", "part_code", "warnings"]
+                    "required": ["desc", "kind", "qty", "unit", "unit_price", "line_total", "currency", "warnings", "part_code"]
                 }
             },
             "warnings": {"type": "array", "items": {"type": "string"}},
@@ -659,13 +708,13 @@ def _openai_fallback(image_bytes: bytes, raw_text: str) -> DevizResponse:
         "Extrage date structurate dintr-un deviz auto in format JSON.\n"
         "Vreau sa returnezi:\n"
         "- items: fiecare linie din manopera si piese (kind = 'labor' sau 'part')\n"
-        "- pentru piese: daca exista un cod piesa (alfa-numeric), pune-l in part_code, altfel null\n"
-        "- totals: materials, labor, grand_total, currency\n"
+        "- totals: materials, labor, grand_total, currency (RON)\n"
         "- document: service_name, client_name, vehicle, date, number daca se vad\n"
+        "- part_code: cod piesa / cod produs daca apare (altfel null). NU inventa.\n"
         "Reguli:\n"
         "- Nu inventa valori. Daca lipseste ceva, pune null sau 0 unde e numeric.\n"
         "- Pastreaza cantitatile si totalurile exact cum apar.\n"
-        "- Daca un rand contine si operatie si material (tabel combinat), creeaza 2 items.\n"
+        "- Daca un rand contine si operatie si material (tabel combinat), creeaza 2 items: unul labor (operatie) si unul part (material).\n"
     )
 
     req = {
@@ -699,6 +748,7 @@ def _openai_fallback(image_bytes: bytes, raw_text: str) -> DevizResponse:
         raise HTTPException(status_code=502, detail=f"OpenAI error: {r.text}")
 
     data = r.json()
+
     out_text = None
     try:
         for o in data.get("output", []):
@@ -763,6 +813,7 @@ def _build_response_from_primary(words: List[_Word], raw_text: str) -> DevizResp
 
     lines = reconstruct_lines_from_words(words)
     items: List[ExtractedItem] = []
+
     used_parser = "generic_lines"
 
     if _detect_autodeviz_table(lines):
@@ -866,7 +917,3 @@ async def process_deviz_file(file: UploadFile = File(...)):
     if not data:
         raise HTTPException(status_code=400, detail="Empty file")
     return _process_image(data)
-
-
-if __name__ == "__main__":
-    print("Run with: uvicorn main:app --host 0.0.0.0 --port 8000")
