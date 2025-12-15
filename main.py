@@ -168,6 +168,14 @@ def _is_junk_code(tok: str) -> bool:
     if not (has_alpha and has_digit):
         return True
 
+    # NEW: respingem "ambreiaj5" / cuvinte + o singura cifra
+    digit_count = sum(ch.isdigit() for ch in t)
+    if digit_count < 2:
+    # exceptie: coduri tip 365.372
+    if re.fullmatch(r"\d{3}\.\d{3}", t):
+            return False
+        return True
+    
     return False
 
 
