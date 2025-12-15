@@ -479,6 +479,34 @@ async def process_deviz_file(
         reconstructed_text_preview=lines[:8],
     )
 
+from pydantic import BaseModel
+import requests
+
+class DevizUrlPayload(BaseModel):
+    url: str
+
+@app.post("/process_deviz_url")
+def process_deviz_url(payload: DevizUrlPayload):
+    # descarca fisierul din Airtable (link-ul din attachment)
+    r = requests.get(payload.url, timeout=60)
+    if r.status_code != 200:
+        return {"error": "failed_to_download", "status_code": r.status_code, "text": r.text[:500]}
+
+    content = r.content
+
+    # IMPORTANT:
+    # Aici trebuie sa chemi aceeasi logica pe care o folosesti deja in /process_deviz_file,
+    # doar ca ii dai bytes in loc de UploadFile.
+    #
+    # Daca ai deja o functie care face procesarea (recomandat), cheam-o aici.
+    # Exemplu:
+    # return process_image_bytes(content, filename="deviz.png")
+
+    # Daca momentan nu ai functie separata, spune-mi cum se numeste endpoint-ul tau intern
+    # (ce face /process_deviz_file) si iti dau exact refactor-ul minim.
+
+    return {"ok": True, "bytes": len(content)}
+    
 @app.get("/health")
 def health():
     return {"ok": True}
