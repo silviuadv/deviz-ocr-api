@@ -318,21 +318,15 @@ def parse_material_table_zip(section_lines: List[str], default_currency: str) ->
 
 def parse_labor_table_zip(section_lines: List[str], default_currency: str) -> List[Dict[str, Any]]:
     """
-    Model 2 labor often OCRs as a STREAM:
-      h
-      3.00
-      90.00
-      h
-      3.00
-      60.00
-      270.00
-      180.00
-    We pair each 'Manopera ...' description with the next (unit, qty, price, value)
-    in sequence.
+    Model 2 labor OCR often becomes a stream like:
+      h, 3.00, 90.00, h, 3.00, 60.00, 270.00, 180.00
+    Where line totals are often AFTER all rows. We therefore:
+      - pair each 'Manopera ...' with next (UNIT, qty, price)
+      - then assign last N numeric values as totals (N = number of rows),
+        otherwise fallback to qty*price.
     """
     descs: List[str] = []
-    stream: List[Any] = []  # mix of "UNIT" tokens + float numbers
-
+    stream: List[Any] = []  # "UNIT" tokens + float numbers
     in_table = False
 
     for raw in section_lines:
@@ -343,8 +337,8 @@ def parse_labor_table_zip(section_lines: List[str], default_currency: str) -> Li
         if "total deviz" in nr:
             break
 
-        # start when we see the header (U.M / Cantitate etc)
-        if ("u.m" in nr or "u/m" in nr) and ("cantitate" in nr or "cantit" in nr):
+        # header detection
+        if (("u.m" in nr or "u/m" in nr) and ("cantitate" in nr or "cantit" in nr)):
             in_table = True
             continue
 
@@ -366,16 +360,20 @@ def parse_labor_table_zip(section_lines: List[str], default_currency: str) -> Li
             stream.append(float(nr))
             continue
 
-        # ignore totals/subtotals text
+        # ignore totals/subtotals labels
         if "total materiale" in nr or "total manopera" in nr:
             continue
 
     if not descs:
         return []
 
-    items: List[Dict[str, Any]] = []
+    # helper: extract all floats in order from stream
+    all_floats = [x for x in stream if isinstance(x, float)]
 
-    idx = 0  # pointer in stream
+    # we will parse rows as: UNIT -> qty -> price
+    rows_tmp: List[Dict[str, Any]] = []
+    idx = 0
+
     for raw_desc in descs:
         # find next UNIT
         while idx < len(stream) and stream[idx] != "UNIT":
@@ -384,22 +382,39 @@ def parse_labor_table_zip(section_lines: List[str], default_currency: str) -> Li
             break
         idx += 1  # consume UNIT
 
-        # expect qty, price
+        # expect qty and price
         if idx + 1 >= len(stream) or not isinstance(stream[idx], float) or not isinstance(stream[idx + 1], float):
             break
-        qty = float(stream[idx]); unit_price = float(stream[idx + 1])
+
+        qty = float(stream[idx])
+        unit_price = float(stream[idx + 1])
         idx += 2
 
-        # value might appear after ALL rows, so we allow scanning forward:
-        # take the next float as line_total
-        while idx < len(stream) and not isinstance(stream[idx], float):
-            idx += 1
-        if idx >= len(stream):
-            break
-        line_total = float(stream[idx])
-        idx += 1
+        desc = normalize_desc_for_storage(raw_desc)
 
-        desc = normalize_desc_for_storage(raw_desc.replace("manopera", "").strip())
+        rows_tmp.append({
+            "raw": clean_text(raw_desc),
+            "desc": desc,
+            "kind": "labor",
+            "qty": qty,
+            "unit": "ore",
+            "unit_price": unit_price,
+        })
+
+    # assign totals: prefer last N floats as totals (when they appear at the end)
+    n = len(rows_tmp)
+    totals_tail = all_floats[-n:] if len(all_floats) >= n else []
+    use_tail = len(totals_tail) == n and all(t >= 0 for t in totals_tail)
+
+    items: List[Dict[str, Any]] = []
+    for i, row in enumerate(rows_tmp):
+        qty = row["qty"]
+        unit_price = row["unit_price"]
+
+        if use_tail:
+            line_total = float(totals_tail[i])
+        else:
+            line_total = float(qty * unit_price)
 
         warnings: List[str] = []
         calc = qty * unit_price
@@ -407,15 +422,10 @@ def parse_labor_table_zip(section_lines: List[str], default_currency: str) -> Li
             warnings.append(f"inconsistent_total: qty*unit_price={calc:.2f} vs total={line_total:.2f}")
 
         items.append({
-            "raw": clean_text(raw_desc),
-            "desc": desc,
-            "kind": "labor",
-            "qty": qty,
-            "unit": "ore",
-            "unit_price": unit_price,
+            **row,
             "line_total": line_total,
             "currency": default_currency,
-            "confidence_fields": {"qty": 0.9, "unit": 0.9, "unit_price": 0.9, "line_total": 0.9},
+            "confidence_fields": {"qty": 0.9, "unit": 0.9, "unit_price": 0.9, "line_total": 0.8 if use_tail else 0.6},
             "warnings": warnings,
         })
 
