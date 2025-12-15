@@ -72,14 +72,41 @@ def _safe_float(x: Any) -> Optional[float]:
             return None
         if isinstance(x, (int, float)):
             return float(x)
+
         s = str(x).strip()
         if not s:
             return None
-        # Romanian/Euro formats: 1.200,00 or 1200,00
+
         s = s.replace(" ", "")
-        if re.search(r"\d,\d{1,2}$", s):
-            s = s.replace(".", "").replace(",", ".")
-        return float(s)
+
+        # Case A: has BOTH comma and dot -> assume comma = thousands, dot = decimal (e.g. 6,000.0)
+        if "," in s and "." in s:
+            s = s.replace(",", "")
+            return float(s)
+
+        # Case B: only comma
+        if "," in s and "." not in s:
+            # if looks like thousands grouping: 1,234 or 12,345,678
+            if re.fullmatch(r"\d{1,3}(,\d{3})+(\.\d+)?", s):
+                s = s.replace(",", "")
+                return float(s)
+            # else assume comma is decimal separator: 123,45
+            if re.fullmatch(r"\d+,\d{1,4}", s):
+                s = s.replace(",", ".")
+                return float(s)
+            # fallback: strip commas
+            s = s.replace(",", "")
+            return float(s)
+
+        # Case C: only dot (normal decimal): 3.00 / 90.00
+        if "." in s and "," not in s:
+            return float(s)
+
+        # Case D: plain int
+        if re.fullmatch(r"\d+", s):
+            return float(s)
+
+        return None
     except Exception:
         return None
 
@@ -197,17 +224,14 @@ def reconstruct_lines_from_words(words: List[_Word]) -> List[str]:
 def _split_tail_numbers(line: str) -> Tuple[str, List[float]]:
     parts = line.split()
     nums: List[float] = []
+
     # walk from end: collect numeric tokens
     for p in reversed(parts):
-        clean = p.replace(" ", "")
-        clean2 = clean.replace(".", "").replace(",", ".")
-        if re.fullmatch(r"\d+(\.\d+)?", clean2 or ""):
-            try:
-                nums.insert(0, float(clean2))
-            except Exception:
-                break
-        else:
+        val = _safe_float(p)
+        if val is None:
             break
+        nums.insert(0, val)
+
     desc = " ".join(parts[: max(0, len(parts) - len(nums))])
     return _norm_spaces(desc), nums
 
