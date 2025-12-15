@@ -2,511 +2,746 @@ import os
 import re
 import json
 import base64
+import logging
+from io import BytesIO
+from typing import List, Optional, Dict, Any, Tuple
+
 import requests
-from typing import Any, Dict, List, Optional, Tuple
-from fastapi import FastAPI, UploadFile, File, Form
-from pydantic import BaseModel
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from pydantic import BaseModel, Field
 
-app = FastAPI(title="Deviz Parser Hybrid: Vision Layout Primary + GPT Fallback")
+from PIL import Image
 
-GOOGLE_VISION_API_KEY = os.getenv("GOOGLE_VISION_API_KEY", "")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+# Optional PDF support (recommended)
+try:
+    import fitz  # PyMuPDF
+except Exception:
+    fitz = None
+
+# Optional OpenAI (fallback)
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
+
+
+# ----------------------------
+# Config + Logging
+# ----------------------------
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("deviz-ocr")
+
+GOOGLE_VISION_API_KEY = os.getenv("GOOGLE_VISION_API_KEY", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o").strip()
+FALLBACK_SCORE_THRESHOLD = float(os.getenv("FALLBACK_SCORE_THRESHOLD", "0.65"))
+
+if not GOOGLE_VISION_API_KEY:
+    log.warning("GOOGLE_VISION_API_KEY is missing. Primary OCR will fail.")
+if not OPENAI_API_KEY:
+    log.warning("OPENAI_API_KEY is missing. Fallback will fail.")
+if OpenAI is None:
+    log.warning("openai package not available. Fallback will fail.")
+
+
+app = FastAPI(title="Deviz Parser Hybrid: Vision Layout Primary + GPT Fallback", version="0.1.0")
+
 
 # ----------------------------
 # Models
 # ----------------------------
+class DevizUrlPayload(BaseModel):
+    url: str = Field(..., description="Public URL for the deviz file (png/jpg/pdf).")
 
-class Vehicle(BaseModel):
-    brand: Optional[str] = None
-    model: Optional[str] = None
-    engine: Optional[str] = None
-    year_range: Optional[str] = None
 
 class ExtractedItem(BaseModel):
-    raw: str
-    desc: str
-    kind: str  # part / labor / fee / unknown
-    qty: Optional[float] = None
+    type: str  # "part" | "labor"
+    description: str
+    qty: float
     unit: Optional[str] = None
-    unit_price: Optional[float] = None
-    line_total: Optional[float] = None
-    currency: str = "unknown"
+    unit_price: float
+    line_total: float
+    currency: str = "RON"
     warnings: List[str] = []
 
-class ParseResult(BaseModel):
-    source: str  # "google_vision_layout" or "gpt_fallback"
-    total_detected: Optional[float] = None
-    currency: str = "unknown"
-    sum_lines: Optional[float] = None
-    warnings: List[str] = []
-    items: List[ExtractedItem] = []
-    score: Dict[str, Any] = {}
-    reconstructed_text_preview: List[str] = []
+
+class ExtractedTotals(BaseModel):
+    materials: Optional[float] = None
+    labor: Optional[float] = None
+    vat: Optional[float] = None
+    subtotal_no_vat: Optional[float] = None
+    grand_total: Optional[float] = None
+    currency: str = "RON"
+
+
+class DevizResult(BaseModel):
+    ok: bool = True
+    source: str  # "google_vision" | "gpt_fallback"
+    score: float
+    items: List[ExtractedItem]
+    totals: ExtractedTotals
+    debug: Dict[str, Any] = {}
+
 
 # ----------------------------
-# Helpers: numbers / text
+# Helpers: file download + normalize to image bytes
 # ----------------------------
-
-CURRENCY_RE = re.compile(r"\b(ron|lei|eur|euro)\b", re.IGNORECASE)
-
-def detect_currency(text: str) -> str:
-    hits = CURRENCY_RE.findall(text or "")
-    hits = [h.lower() for h in hits]
-    if not hits:
-        return "unknown"
-    if "eur" in hits or "euro" in hits:
-        if "ron" in hits or "lei" in hits:
-            return "mixed"
-        return "EUR"
-    return "RON"
-
-def normalize_num_token(tok: str) -> Optional[float]:
-    # handles "1,070.00" or "1070.00" or "1.070,00"
-    t = tok.strip()
-    if not t:
-        return None
-    # keep digits and separators only
-    if not re.search(r"\d", t):
-        return None
-
-    # if both ',' and '.' appear -> assume one is thousands
-    if "," in t and "." in t:
-        # common in RO OCR: 1,070.00 = 1070.00
-        # if comma before dot -> comma thousands
-        if t.find(",") < t.find("."):
-            t = t.replace(",", "")
-            try:
-                return float(t)
-            except:
-                return None
-        # else: 1.070,00 -> dot thousands, comma decimals
-        t = t.replace(".", "").replace(",", ".")
-        try:
-            return float(t)
-        except:
-            return None
-
-    # only comma -> could be decimal
-    if "," in t and "." not in t:
-        t = t.replace(".", "").replace(",", ".")
-        try:
-            return float(t)
-        except:
-            return None
-
-    # only dot
+def _download_bytes(url: str) -> Tuple[bytes, str]:
     try:
-        return float(t.replace(",", ""))
-    except:
-        return None
+        r = requests.get(url, timeout=60, allow_redirects=True)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not download url: {e}")
 
-def guess_kind(desc: str) -> str:
-    d = (desc or "").lower()
-    labor_k = ["manopera", "ore", "ora", "labor", "diagnoza", "diagnostic", "verificare"]
-    fee_k = ["taxa", "consumabile", "materiale", "transport", "ecotaxa", "deviz", "service"]
-    if any(k in d for k in labor_k):
-        return "labor"
-    if any(k in d for k in fee_k):
-        return "fee"
-    return "part" if len(d) > 0 else "unknown"
+    if r.status_code >= 400:
+        raise HTTPException(status_code=400, detail=f"Could not download url. HTTP {r.status_code}")
 
-def is_noise_line(line: str) -> bool:
-    l = (line or "").strip().lower()
-    if len(l) < 3:
-        return True
-    # obvious headers/footers
-    junk = ["c.i.f", "cif", "beneficiar", "adresa", "telefon", "nr reg", "pagina", "page", "semnatura", "stampila"]
-    if any(j in l for j in junk):
-        return True
-    # table headers
-    table_hdr = ["denumire", "u/m", "cantitate", "pret", "valoare", "red", "tva", "subtotal", "total materiale", "total manopera"]
-    if any(h == l or l.startswith(h) for h in table_hdr):
-        return True
-    return False
+    content_type = (r.headers.get("Content-Type") or "").lower().split(";")[0].strip()
+    return r.content, content_type
+
+
+def _pdf_first_page_to_png_bytes(pdf_bytes: bytes) -> bytes:
+    if fitz is None:
+        raise HTTPException(
+            status_code=400,
+            detail="PDF received but PyMuPDF is not installed. Add 'pymupdf' to requirements.txt."
+        )
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    if doc.page_count < 1:
+        raise HTTPException(status_code=400, detail="Empty PDF.")
+    page = doc.load_page(0)
+    pix = page.get_pixmap(dpi=220, alpha=False)  # decent OCR quality
+    return pix.tobytes("png")
+
+
+def _normalize_to_png_bytes(file_bytes: bytes, content_type: str) -> bytes:
+    # If PDF -> render first page to PNG
+    if "pdf" in content_type or file_bytes[:4] == b"%PDF":
+        return _pdf_first_page_to_png_bytes(file_bytes)
+
+    # Otherwise try PIL to convert to PNG
+    try:
+        img = Image.open(BytesIO(file_bytes))
+        img = img.convert("RGB")
+        out = BytesIO()
+        img.save(out, format="PNG", optimize=True)
+        return out.getvalue()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Unsupported image format or corrupted file: {e}")
+
 
 # ----------------------------
-# Google Vision call + layout reconstruction
+# Google Vision: call + layout reconstruction
 # ----------------------------
-
-class TextWord:
+class _TextWord:
+    __slots__ = ("text", "x", "y", "h")
     def __init__(self, text: str, x: int, y: int, h: int):
         self.text = text
         self.x = x
         self.y = y
         self.h = h
 
-def call_google_vision_text_detection(image_b64: str) -> Dict[str, Any]:
+
+def _google_vision_document_text_detection(png_bytes: bytes) -> Dict[str, Any]:
     if not GOOGLE_VISION_API_KEY:
-        raise RuntimeError("Missing GOOGLE_VISION_API_KEY")
+        raise HTTPException(status_code=500, detail="Server missing GOOGLE_VISION_API_KEY")
+
     url = f"https://vision.googleapis.com/v1/images:annotate?key={GOOGLE_VISION_API_KEY}"
     body = {
         "requests": [{
-            "image": {"content": image_b64},
-            "features": [{"type": "TEXT_DETECTION"}]
+            "image": {"content": base64.b64encode(png_bytes).decode("utf-8")},
+            "features": [{"type": "DOCUMENT_TEXT_DETECTION"}],
         }]
     }
-    r = requests.post(url, json=body, timeout=60)
-    r.raise_for_status()
+    r = requests.post(url, json=body, timeout=90)
+    if r.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"Google Vision error: {r.status_code} {r.text}")
     return r.json()
 
-def reconstruct_lines_from_google_vision(vision_json: Dict[str, Any]) -> List[str]:
-    words: List[TextWord] = []
+
+def _reconstruct_lines_from_vision(vision_json: Dict[str, Any]) -> List[str]:
+    # Extract words + bounding boxes
+    words: List[_TextWord] = []
+
     try:
-        pages = vision_json["responses"][0]["fullTextAnnotation"]["pages"]
+        resp0 = (vision_json.get("responses") or [])[0] or {}
+        pages = (((resp0.get("fullTextAnnotation") or {}).get("pages")) or [])
         for page in pages:
-            for block in page.get("blocks", []):
-                for paragraph in block.get("paragraphs", []):
-                    for w in paragraph.get("words", []):
-                        txt = "".join(s.get("text", "") for s in w.get("symbols", []))
-                        verts = w.get("boundingBox", {}).get("vertices", [])
-                        if not verts:
+            for block in page.get("blocks", []) or []:
+                for para in block.get("paragraphs", []) or []:
+                    for w in para.get("words", []) or []:
+                        txt = "".join((s.get("text", "") for s in (w.get("symbols", []) or []))).strip()
+                        if not txt:
                             continue
-                        x = int(verts[0].get("x", 0))
-                        y = int(verts[0].get("y", 0))
-                        yb = int(verts[2].get("y", y + 10)) if len(verts) > 2 else y + 10
-                        h = max(1, yb - y)
-                        words.append(TextWord(txt, x, y, h))
+                        verts = (((w.get("boundingBox") or {}).get("vertices")) or [])
+                        if len(verts) < 3:
+                            continue
+                        x = int(verts[0].get("x", 0) or 0)
+                        y = int(verts[0].get("y", 0) or 0)
+                        y2 = int(verts[2].get("y", y + 10) or (y + 10))
+                        h = max(6, y2 - y)
+                        words.append(_TextWord(txt, x, y, h))
     except Exception:
-        # fallback raw text
-        raw = vision_json.get("responses", [{}])[0].get("fullTextAnnotation", {}).get("text", "")
-        return raw.split("\n") if raw else []
+        words = []
 
     if not words:
-        raw = vision_json.get("responses", [{}])[0].get("fullTextAnnotation", {}).get("text", "")
-        return raw.split("\n") if raw else []
+        # fallback to raw text if any
+        resp0 = (vision_json.get("responses") or [])[0] or {}
+        raw = (((resp0.get("fullTextAnnotation") or {}).get("text")) or "").strip()
+        return [ln.strip() for ln in raw.splitlines() if ln.strip()]
 
-    words.sort(key=lambda w: w.y)
+    # Sort by Y then X for clustering
+    words.sort(key=lambda w: (w.y, w.x))
 
-    lines: List[List[TextWord]] = []
-    for word in words:
+    lines: List[List[_TextWord]] = []
+    for w in words:
         placed = False
-        for ln in lines:
-            avg_y = sum(w.y for w in ln) / len(ln)
-            avg_h = sum(w.h for w in ln) / len(ln)
-            if abs(word.y - avg_y) < (avg_h * 0.6):
-                ln.append(word)
+        for line in lines:
+            avg_y = sum(x.y for x in line) / len(line)
+            avg_h = sum(x.h for x in line) / len(line)
+            if abs(w.y - avg_y) <= max(6.0, avg_h * 0.55):
+                line.append(w)
                 placed = True
                 break
         if not placed:
-            lines.append([word])
+            lines.append([w])
 
-    out = []
-    for ln in lines:
-        ln.sort(key=lambda w: w.x)
-        out.append(" ".join(w.text for w in ln).strip())
-    return [x for x in out if x]
+    # For each line: sort by X, then add spaces based on gaps (helps stop "zippering")
+    final_lines: List[str] = []
+    for line_words in lines:
+        line_words.sort(key=lambda w: w.x)
+        parts: List[str] = []
+        prev_x = None
+        for ww in line_words:
+            if prev_x is None:
+                parts.append(ww.text)
+                prev_x = ww.x
+                continue
+            gap = ww.x - prev_x
+            if gap > 55:
+                parts.append("   ")
+            elif gap > 25:
+                parts.append("  ")
+            else:
+                parts.append(" ")
+            parts.append(ww.text)
+            prev_x = ww.x
+        txt = "".join(parts).strip()
+        if txt:
+            final_lines.append(txt)
+
+    # A bit of cleanup: remove duplicates that happen sometimes
+    cleaned: List[str] = []
+    last = None
+    for ln in final_lines:
+        if ln == last:
+            continue
+        cleaned.append(ln)
+        last = ln
+    return cleaned
+
 
 # ----------------------------
-# Parsing reconstructed lines into items
+# Parsing: extract items + totals from reconstructed lines
+# Works for model 1 (Materiale/Piese + Manopera) and model 2 (Lista materiale + Lista operatiuni)
 # ----------------------------
+_NUM_RE = re.compile(r"^\d{1,3}([.,]\d{3})*([.,]\d+)?$|^\d+([.,]\d+)?$")
 
-UNIT_MAP = {
-    "buc": "buc", "buc.": "buc", "pcs": "buc",
-    "h": "ore", "ore": "ore", "ora": "ore"
+def _to_float(s: str) -> Optional[float]:
+    s = (s or "").strip()
+    if not s:
+        return None
+    # "1,070.00" / "1.070,00" / "1070.00" / "1070,00"
+    # heuristic: if both "," and ".", treat the last separator as decimal.
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            # 1.070,00
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            # 1,070.00
+            s = s.replace(",", "")
+    else:
+        # single separator
+        if s.count(",") == 1 and s.count(".") == 0:
+            s = s.replace(",", ".")
+        elif s.count(".") > 1 and s.count(",") == 0:
+            s = s.replace(".", "")
+        elif s.count(",") > 1 and s.count(".") == 0:
+            s = s.replace(",", "")
+
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _extract_trailing_numbers(tokens: List[str]) -> Tuple[List[str], List[float]]:
+    # Walk from end; collect numeric tokens until hit text
+    nums: List[float] = []
+    cut = len(tokens)
+    for i in range(len(tokens) - 1, -1, -1):
+        t = tokens[i].strip()
+        if not t:
+            continue
+        tt = t.replace("RON", "").strip()
+        if _NUM_RE.match(tt):
+            v = _to_float(tt)
+            if v is None:
+                break
+            nums.insert(0, v)
+            cut = i
+        else:
+            break
+    desc_tokens = tokens[:cut]
+    return desc_tokens, nums
+
+
+def _best_qty_price_total(nums: List[float]) -> Tuple[Optional[float], Optional[float], Optional[float], List[str]]:
+    """
+    Tries to pick qty, unit_price, total from a list of extracted numbers.
+    Usually last 3 are qty, price, total, but zippering can reorder.
+    Returns best guess + warnings.
+    """
+    warnings: List[str] = []
+    if len(nums) < 2:
+        return None, None, None, ["missing_fields"]
+
+    # candidates: pick triples among last up to 5 nums
+    tail = nums[-5:] if len(nums) > 5 else nums[:]
+    best = None
+    best_err = 10**18
+
+    # If exactly 2 nums: assume qty, total OR qty, price; we cannot know total -> treat second as total
+    if len(nums) == 2:
+        qty, second = nums[0], nums[1]
+        # qty should be small-ish; if not, swap
+        if qty > 1000 and second <= 1000:
+            qty, second = second, qty
+        # we treat second as total, and unit_price = total/qty if qty != 0
+        unit_price = (second / qty) if qty else second
+        return qty, unit_price, second, ["derived_unit_price"]
+
+    # brute force choose 3 values from tail (order matters by meaning)
+    # we try mapping (qty, price, total) with constraints
+    candidates = []
+    for i in range(len(tail)):
+        for j in range(len(tail)):
+            for k in range(len(tail)):
+                if len({i, j, k}) != 3:
+                    continue
+                q, p, t = tail[i], tail[j], tail[k]
+                if q <= 0 or p < 0 or t < 0:
+                    continue
+                # qty tends to be <= 1000, price <= 1e7, total <= 1e7
+                if q > 50000:
+                    continue
+                err = abs((q * p) - t)
+                candidates.append((err, q, p, t))
+
+    if not candidates:
+        # fallback: take last three
+        q, p, t = nums[-3], nums[-2], nums[-1]
+        warnings.append("heuristic_last_three")
+        return q, p, t, warnings
+
+    candidates.sort(key=lambda x: x[0])
+    err, q, p, t = candidates[0]
+
+    # Accept if err small, else still return but warn
+    if err > max(1.0, t * 0.03):
+        warnings.append(f"inconsistent_total: qty*unit_price={q*p:.2f} vs total={t:.2f}")
+    return q, p, t, warnings
+
+
+def _detect_section(line_l: str) -> Optional[str]:
+    # model 1
+    if "manopera" == line_l.strip():
+        return "labor"
+    if "materiale/piese" in line_l or "materiale" == line_l.strip() or "piese" == line_l.strip():
+        return "part"
+
+    # model 2
+    if "lista materiale" in line_l:
+        return "part"
+    if "lista operatiuni" in line_l or "lista opera" in line_l:
+        return "labor"
+
+    return None
+
+
+def _should_skip_noise(line_l: str) -> bool:
+    noise = [
+        "c.i.f", "nr ord reg com", "adresa:", "judet:", "telefon:",
+        "date client", "date produs", "serie de sasiu", "numar inmatriculare",
+        "pagina", "garantie", "lucrarile au fost", "in conformitate", "hg ",
+        "subtotal", "total materiale", "total manopera", "total deviz", "tva"
+    ]
+    return any(n in line_l for n in noise)
+
+
+def _parse_lines_to_items_and_totals(lines: List[str]) -> Tuple[List[ExtractedItem], ExtractedTotals, Dict[str, Any]]:
+    items: List[ExtractedItem] = []
+    totals = ExtractedTotals(currency="RON")
+    debug: Dict[str, Any] = {"lines_used": 0, "section": None, "found_totals": {}}
+
+    current_section: Optional[str] = None
+
+    # Totals patterns (both models)
+    re_total_deviz = re.compile(r"\btotal\s+deviz\b", re.IGNORECASE)
+    re_total_cu_tva = re.compile(r"\btotal\s+cu\s+tva\b", re.IGNORECASE)
+    re_total_materiale = re.compile(r"\btotal\s+materiale\b", re.IGNORECASE)
+    re_total_manopera = re.compile(r"\btotal\s+manopera\b", re.IGNORECASE)
+    re_subtotal_ftva = re.compile(r"\bsubtotal\b.*\bf\.?tva\b", re.IGNORECASE)
+    re_tva = re.compile(r"\btva\b", re.IGNORECASE)
+
+    for raw in lines:
+        line = (raw or "").strip()
+        if not line:
+            continue
+        line_l = line.lower().strip()
+
+        sec = _detect_section(line_l)
+        if sec:
+            current_section = sec
+            debug["section"] = current_section
+            continue
+
+        # totals lines
+        # (some PDFs put numbers on next line; we handle same-line first)
+        def grab_last_number(s: str) -> Optional[float]:
+            toks = s.replace(":", " ").split()
+            _, nums = _extract_trailing_numbers(toks)
+            return nums[-1] if nums else None
+
+        if re_total_deviz.search(line_l):
+            v = grab_last_number(line)
+            if v is not None:
+                totals.grand_total = v
+                debug["found_totals"]["grand_total"] = v
+            continue
+
+        if re_total_cu_tva.search(line_l):
+            v = grab_last_number(line)
+            if v is not None:
+                totals.grand_total = v
+                debug["found_totals"]["grand_total"] = v
+            continue
+
+        if re_total_materiale.search(line_l):
+            v = grab_last_number(line)
+            if v is not None:
+                totals.materials = v
+                debug["found_totals"]["materials"] = v
+            continue
+
+        if re_total_manopera.search(line_l):
+            v = grab_last_number(line)
+            if v is not None:
+                totals.labor = v
+                debug["found_totals"]["labor"] = v
+            continue
+
+        if re_subtotal_ftva.search(line_l):
+            v = grab_last_number(line)
+            if v is not None:
+                totals.subtotal_no_vat = v
+                debug["found_totals"]["subtotal_no_vat"] = v
+            continue
+
+        # A single TVA line sometimes exists with value
+        if re_tva.fullmatch(line_l.strip(" :")) or line_l.startswith("tva"):
+            v = grab_last_number(line)
+            if v is not None:
+                totals.vat = v
+                debug["found_totals"]["vat"] = v
+            continue
+
+        if _should_skip_noise(line_l):
+            continue
+
+        # Parse table row candidates: must have numbers
+        tokens = line.replace("\t", " ").split()
+        desc_tokens, nums = _extract_trailing_numbers(tokens)
+        if len(nums) < 2:
+            continue
+
+        desc = " ".join(desc_tokens).strip()
+        desc = re.sub(r"^\d+\.?\s*", "", desc)  # remove "1." etc
+
+        # If section not set, guess based on keywords
+        typ = current_section
+        if not typ:
+            if "manopera" in line_l:
+                typ = "labor"
+            else:
+                typ = "part"
+
+        # For labor lines, remove leading "manopera"
+        if typ == "labor":
+            desc = re.sub(r"^manopera\s+", "", desc, flags=re.IGNORECASE).strip()
+
+        # Guess unit
+        unit = None
+        # common: BUC, h, ore
+        if re.search(r"\b(buc|h|ore)\b", line_l):
+            m = re.search(r"\b(buc|h|ore)\b", line_l)
+            unit = m.group(1) if m else None
+            if unit == "h":
+                unit = "ore"
+            if unit == "buc":
+                unit = "buc"
+
+        qty, unit_price, total, warns = _best_qty_price_total(nums)
+        if qty is None or unit_price is None or total is None:
+            continue
+
+        # A VERY common zippering in labor: qty and price swapped or extra numbers from header
+        # Fix: if qty looks like a price and unit_price looks like qty, swap if it improves consistency
+        if typ == "labor":
+            # qty should be small (hours)
+            if qty > 50 and unit_price <= 50:
+                # try swap
+                new_qty, new_price = unit_price, qty
+                if abs((new_qty * new_price) - total) < abs((qty * unit_price) - total):
+                    qty, unit_price = new_qty, new_price
+                    warns.append("swapped_qty_price")
+
+            # Another case: extracted total is actually qty (like 3.0) and total is elsewhere
+            # If total is tiny and qty*price is big, assume total should be qty*price
+            if total <= 10 and (qty * unit_price) >= 50:
+                warns.append("fixed_total_as_qty_price")
+                total = round(qty * unit_price, 2)
+
+        # If still inconsistent but we can derive total from qty*price and it's close to known totals, fix it
+        if any(w.startswith("inconsistent_total") for w in warns):
+            derived = round(qty * unit_price, 2)
+            # if derived looks plausible, and current total is suspicious
+            if derived > 0 and (abs(derived - total) > max(1.0, derived * 0.03)):
+                # keep warning, do not overwrite by default
+                pass
+
+        if len(desc) < 2:
+            continue
+
+        items.append(ExtractedItem(
+            type="labor" if typ == "labor" else "part",
+            description=desc,
+            qty=float(qty),
+            unit=unit,
+            unit_price=float(unit_price),
+            line_total=float(total),
+            currency="RON",
+            warnings=warns
+        ))
+        debug["lines_used"] += 1
+
+    # Post totals: if not found, compute from items
+    parts_sum = round(sum(i.line_total for i in items if i.type == "part"), 2) if items else 0.0
+    labor_sum = round(sum(i.line_total for i in items if i.type == "labor"), 2) if items else 0.0
+    if totals.materials is None and parts_sum > 0:
+        totals.materials = parts_sum
+    if totals.labor is None and labor_sum > 0:
+        totals.labor = labor_sum
+    if totals.grand_total is None and (parts_sum + labor_sum) > 0:
+        totals.grand_total = round(parts_sum + labor_sum, 2)
+
+    return items, totals, debug
+
+
+def _score_extraction(items: List[ExtractedItem], totals: ExtractedTotals) -> float:
+    if not items:
+        return 0.0
+
+    # Consistency ratio
+    consistent = 0
+    for it in items:
+        if abs((it.qty * it.unit_price) - it.line_total) <= max(1.0, it.line_total * 0.03):
+            consistent += 1
+    ratio_consistent = consistent / max(1, len(items))
+
+    # Has both sections?
+    has_part = any(i.type == "part" for i in items)
+    has_labor = any(i.type == "labor" for i in items)
+    ratio_sections = 1.0 if (has_part and has_labor) else 0.6 if (has_part or has_labor) else 0.0
+
+    # Totals plausibility
+    sum_items = round(sum(i.line_total for i in items), 2)
+    total_score = 0.7
+    if totals.grand_total is not None and sum_items > 0:
+        diff = abs(totals.grand_total - sum_items)
+        total_score = 1.0 if diff <= max(2.0, totals.grand_total * 0.03) else 0.5
+
+    score = 0.55 * ratio_consistent + 0.25 * ratio_sections + 0.20 * total_score
+    return round(float(score), 4)
+
+
+# ----------------------------
+# GPT fallback: Vision-to-JSON
+# ----------------------------
+_FALLBACK_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "type": {"type": "string", "enum": ["part", "labor"]},
+                    "description": {"type": "string"},
+                    "qty": {"type": "number"},
+                    "unit": {"type": ["string", "null"]},
+                    "unit_price": {"type": "number"},
+                    "line_total": {"type": "number"},
+                    "currency": {"type": "string"}
+                },
+                "required": ["type", "description", "qty", "unit_price", "line_total", "currency"]
+            }
+        },
+        "totals": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "materials": {"type": ["number", "null"]},
+                "labor": {"type": ["number", "null"]},
+                "vat": {"type": ["number", "null"]},
+                "subtotal_no_vat": {"type": ["number", "null"]},
+                "grand_total": {"type": ["number", "null"]},
+                "currency": {"type": "string"}
+            },
+            "required": ["currency"]
+        }
+    },
+    "required": ["items", "totals"]
 }
 
-def parse_line_as_item(line: str, default_currency: str) -> Optional[ExtractedItem]:
-    raw = (line or "").strip()
-    if not raw or is_noise_line(raw):
-        return None
 
-    l = raw.strip()
-    # collect numeric tokens from end
-    parts = l.split()
-    nums: List[float] = []
-    # how many tokens at end are numeric
-    consumed = 0
-    for tok in reversed(parts):
-        v = normalize_num_token(tok)
-        if v is None:
-            break
-        nums.insert(0, v)
-        consumed += 1
-
-    # if no numbers => skip
-    if len(nums) == 0:
-        # still allow labor lines (sometimes numbers are on next line) -> skip here
-        return None
-
-    desc_tokens = parts[:-consumed] if consumed > 0 else parts[:]
-    desc = " ".join(desc_tokens).strip()
-
-    # detect unit token inside desc (like "BUC", "h")
-    unit = None
-    for t in parts:
-        tt = t.lower()
-        if tt in UNIT_MAP:
-            unit = UNIT_MAP[tt]
-            break
-
-    kind = guess_kind(desc)
-
-    qty = unit_price = line_total = None
-    warnings: List[str] = []
-
-    # best case: 3 numbers = qty, price, total (or qty, price, total)
-    if len(nums) >= 3:
-        # try last 3 as qty, unit_price, total
-        q, p, tot = nums[-3], nums[-2], nums[-1]
-        # validate
-        if q > 0 and p > 0 and tot > 0:
-            qty, unit_price, line_total = q, p, tot
-        else:
-            warnings.append("bad_numbers")
-    elif len(nums) == 2:
-        # sometimes row has qty and total only (no unit price)
-        # pick qty=first, total=second
-        q, tot = nums[0], nums[1]
-        if q > 0 and tot > 0:
-            qty, line_total = q, tot
-            warnings.append("missing_unit_price")
-        else:
-            warnings.append("bad_numbers")
-    else:
-        # 1 number only -> likely noise (dates, ids)
-        return None
-
-    # currency
-    currency = default_currency
-    if CURRENCY_RE.search(l):
-        currency = detect_currency(l)
-        if currency == "mixed":
-            currency = default_currency
-
-    # sanity check if all 3 exist
-    if qty is not None and unit_price is not None and line_total is not None:
-        calc = qty * unit_price
-        if abs(calc - line_total) > max(1.0, 0.05 * line_total):
-            warnings.append(f"inconsistent_total: qty*unit_price={calc:.2f} vs total={line_total:.2f}")
-
-    # filter out ridiculous totals from IDs etc
-    if line_total is not None and line_total > 1_000_000:
-        return None
-
-    if len(desc) < 3:
-        return None
-
-    return ExtractedItem(
-        raw=raw,
-        desc=desc.lower(),
-        kind=kind,
-        qty=qty,
-        unit=unit,
-        unit_price=unit_price,
-        line_total=line_total,
-        currency=currency,
-        warnings=warnings
-    )
-
-def extract_total_from_lines(lines: List[str]) -> Optional[float]:
-    # prefer "TOTAL DEVIZ" or "Total cu TVA" etc
-    priority = [
-        re.compile(r"\btotal\s+deviz\b", re.IGNORECASE),
-        re.compile(r"\btotal\s+cu\s+tva\b", re.IGNORECASE),
-        re.compile(r"\btotal\b", re.IGNORECASE),
-    ]
-    candidates: List[Tuple[int, float]] = []
-    for i, ln in enumerate(lines):
-        nums = [normalize_num_token(t) for t in ln.split()]
-        nums = [n for n in nums if n is not None]
-        if not nums:
-            continue
-        for pr, rx in enumerate(priority):
-            if rx.search(ln):
-                candidates.append((pr, nums[-1]))
-                break
-    if not candidates:
-        return None
-    candidates.sort(key=lambda x: x[0])
-    return candidates[0][1]
-
-def score_quality(items: List[ExtractedItem], total: Optional[float]) -> Dict[str, Any]:
-    valid3 = [it for it in items if it.qty is not None and it.unit_price is not None and it.line_total is not None]
-    sum_lines = sum(it.line_total for it in valid3) if valid3 else 0.0
-    mismatch = None
-    if total is not None and sum_lines > 0:
-        mismatch = abs(total - sum_lines)
-    # simple score 0..1
-    score = 0.0
-    if total is not None:
-        score += 0.35
-    score += min(0.45, 0.15 * len(valid3))  # more items => higher
-    if mismatch is not None:
-        if mismatch <= max(2.0, 0.05 * total):
-            score += 0.20
-    return {
-        "valid_items_with_qty_price_total": len(valid3),
-        "sum_lines_valid": sum_lines if valid3 else None,
-        "total": total,
-        "mismatch_abs": mismatch,
-        "score_0_1": round(min(1.0, score), 3),
-    }
-
-# ----------------------------
-# GPT fallback (Vision LLM)
-# ----------------------------
-
-def call_gpt_vision_extract(image_b64: str) -> Dict[str, Any]:
+def _gpt_fallback_parse(png_bytes: bytes) -> Tuple[List[ExtractedItem], ExtractedTotals, Dict[str, Any]]:
+    if OpenAI is None:
+        raise HTTPException(status_code=500, detail="openai package not installed on server")
     if not OPENAI_API_KEY:
-        raise RuntimeError("Missing OPENAI_API_KEY")
+        raise HTTPException(status_code=500, detail="Server missing OPENAI_API_KEY")
 
-    # schema output we want
-    system = "You extract structured data from Romanian car repair estimates (devize). Output strict JSON."
-    user = {
-        "task": "Extract line items (parts + labor) and the final total from this deviz image. Return JSON.",
-        "rules": [
-            "For each item return: desc, kind(part|labor|fee|unknown), qty, unit, unit_price, line_total, currency.",
-            "If unit is 'h' treat as 'ore'.",
-            "Prefer 'TOTAL DEVIZ' or 'Total cu TVA' as total.",
-            "Do not hallucinate values; if missing set null."
-        ]
-    }
+    client = OpenAI(api_key=OPENAI_API_KEY)
 
-    payload = {
-        "model": "gpt-4o-mini",
-        "temperature": 0,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": [
-                {"type": "text", "text": json.dumps(user, ensure_ascii=False)},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}}
-            ]}
-        ]
-    }
-
-    r = requests.post(
-        "https://api.openai.com/v1/chat/completions",
-        headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-        json=payload,
-        timeout=90
+    b64 = base64.b64encode(png_bytes).decode("utf-8")
+    prompt = (
+        "Extract structured data from this Romanian auto repair estimate/invoice (deviz). "
+        "Return ONLY valid JSON matching the provided schema. "
+        "Rules: items must be split into part vs labor. qty, unit_price, line_total must be numeric. "
+        "If unit is shown as BUC use 'buc', if shown as 'h' or 'ore' use 'ore'. Currency RON."
     )
-    r.raise_for_status()
-    data = r.json()
-    txt = data["choices"][0]["message"]["content"]
-    return json.loads(txt)
+
+    # Using Responses API style
+    resp = client.responses.create(
+        model=OPENAI_MODEL,
+        input=[{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": prompt},
+                {"type": "input_image", "image_url": f"data:image/png;base64,{b64}"}
+            ]
+        }],
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "deviz_extract",
+                "schema": _FALLBACK_SCHEMA,
+                "strict": True
+            }
+        }
+    )
+
+    out_text = resp.output_text
+    try:
+        data = json.loads(out_text)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"GPT fallback returned invalid JSON: {e}")
+
+    items = []
+    for it in data.get("items", []):
+        items.append(ExtractedItem(
+            type=it["type"],
+            description=it["description"],
+            qty=float(it["qty"]),
+            unit=it.get("unit"),
+            unit_price=float(it["unit_price"]),
+            line_total=float(it["line_total"]),
+            currency=it.get("currency") or "RON",
+            warnings=[]
+        ))
+
+    t = data.get("totals") or {}
+    totals = ExtractedTotals(
+        materials=t.get("materials"),
+        labor=t.get("labor"),
+        vat=t.get("vat"),
+        subtotal_no_vat=t.get("subtotal_no_vat"),
+        grand_total=t.get("grand_total"),
+        currency=t.get("currency") or "RON"
+    )
+
+    return items, totals, {"gpt_model": OPENAI_MODEL}
+
 
 # ----------------------------
-# Endpoint: upload file, primary vision layout, fallback to GPT if weak
+# Orchestrator
 # ----------------------------
+def _process_png_bytes(png_bytes: bytes) -> DevizResult:
+    vision_json = _google_vision_document_text_detection(png_bytes)
+    lines = _reconstruct_lines_from_vision(vision_json)
 
-@app.post("/process_deviz_file")
-async def process_deviz_file(
-    file: UploadFile = File(...),
-    vin: str = Form(""),
-    brand: str = Form(""),
-    model: str = Form(""),
-    engine: str = Form(""),
-    year_range: str = Form(""),
-):
-    content = await file.read()
-    image_b64 = base64.b64encode(content).decode("utf-8")
+    items, totals, debug = _parse_lines_to_items_and_totals(lines)
+    score = _score_extraction(items, totals)
 
-    # 1) Google Vision + layout reconstruction
-    vision_json = call_google_vision_text_detection(image_b64)
-    lines = reconstruct_lines_from_google_vision(vision_json)
+    debug["score_components"] = {
+        "items_count": len(items),
+        "grand_total": totals.grand_total,
+    }
+    debug["preview_lines"] = lines[:40]  # for debug, safe to keep some
 
-    default_currency = detect_currency("\n".join(lines))
-    total = extract_total_from_lines(lines)
+    if score < FALLBACK_SCORE_THRESHOLD:
+        log.info(f"Score {score} below threshold {FALLBACK_SCORE_THRESHOLD}, using GPT fallback.")
+        fb_items, fb_totals, fb_debug = _gpt_fallback_parse(png_bytes)
+        fb_score = _score_extraction(fb_items, fb_totals)
 
-    items: List[ExtractedItem] = []
-    for ln in lines:
-        it = parse_line_as_item(ln, default_currency)
-        if it:
-            items.append(it)
-
-    score = score_quality(items, total)
-
-    # 2) decide fallback
-    need_fallback = False
-    if score["score_0_1"] < 0.55:
-        need_fallback = True
-    if score["valid_items_with_qty_price_total"] < 2:
-        need_fallback = True
-    if total is None:
-        need_fallback = True
-
-    warnings: List[str] = []
-    if need_fallback:
-        warnings.append("low_confidence_primary_layout_parser -> gpt_fallback")
-
-        gpt = call_gpt_vision_extract(image_b64)
-
-        # expect gpt keys: total_detected, currency, items[]
-        gpt_total = gpt.get("total_detected") or gpt.get("total") or None
-        gpt_currency = gpt.get("currency") or default_currency or "unknown"
-        gpt_items = []
-        for x in gpt.get("items", []):
-            gpt_items.append(ExtractedItem(
-                raw=x.get("raw") or x.get("desc") or "",
-                desc=(x.get("desc") or "").lower(),
-                kind=x.get("kind") or "unknown",
-                qty=x.get("qty"),
-                unit=x.get("unit"),
-                unit_price=x.get("unit_price"),
-                line_total=x.get("line_total"),
-                currency=x.get("currency") or gpt_currency,
-                warnings=x.get("warnings") or [],
-            ))
-
-        # recompute sum_lines
-        valid3 = [it for it in gpt_items if it.qty is not None and it.unit_price is not None and it.line_total is not None]
-        sum_lines = sum(it.line_total for it in valid3) if valid3 else None
-
-        return ParseResult(
+        return DevizResult(
+            ok=True,
             source="gpt_fallback",
-            total_detected=gpt_total,
-            currency=gpt_currency,
-            sum_lines=sum_lines,
-            warnings=warnings,
-            items=gpt_items,
-            score={"primary_score": score, "fallback_used": True},
-            reconstructed_text_preview=lines[:8],
+            score=fb_score,
+            items=fb_items,
+            totals=fb_totals,
+            debug={"primary_score": score, "threshold": FALLBACK_SCORE_THRESHOLD, **fb_debug}
         )
 
-    # primary accepted
-    valid3 = [it for it in items if it.qty is not None and it.unit_price is not None and it.line_total is not None]
-    sum_lines = sum(it.line_total for it in valid3) if valid3 else None
-
-    return ParseResult(
-        source="google_vision_layout",
-        total_detected=total,
-        currency=default_currency,
-        sum_lines=sum_lines,
-        warnings=warnings,
-        items=items,
+    return DevizResult(
+        ok=True,
+        source="google_vision",
         score=score,
-        reconstructed_text_preview=lines[:8],
+        items=items,
+        totals=totals,
+        debug=debug
     )
 
-from pydantic import BaseModel
-import requests
 
-class DevizUrlPayload(BaseModel):
-    url: str
-
-@app.post("/process_deviz_url")
-def process_deviz_url(payload: DevizUrlPayload):
-    # descarca fisierul din Airtable (link-ul din attachment)
-    r = requests.get(payload.url, timeout=60)
-    if r.status_code != 200:
-        return {"error": "failed_to_download", "status_code": r.status_code, "text": r.text[:500]}
-
-    content = r.content
-
-    # IMPORTANT:
-    # Aici trebuie sa chemi aceeasi logica pe care o folosesti deja in /process_deviz_file,
-    # doar ca ii dai bytes in loc de UploadFile.
-    #
-    # Daca ai deja o functie care face procesarea (recomandat), cheam-o aici.
-    # Exemplu:
-    # return process_image_bytes(content, filename="deviz.png")
-
-    # Daca momentan nu ai functie separata, spune-mi cum se numeste endpoint-ul tau intern
-    # (ce face /process_deviz_file) si iti dau exact refactor-ul minim.
-
-    return {"ok": True, "bytes": len(content)}
-    
+# ----------------------------
+# Routes
+# ----------------------------
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+@app.post("/process_deviz_url", response_model=DevizResult)
+def process_deviz_url(payload: DevizUrlPayload):
+    file_bytes, content_type = _download_bytes(payload.url)
+    png_bytes = _normalize_to_png_bytes(file_bytes, content_type)
+    return _process_png_bytes(png_bytes)
+
+
+@app.post("/process_deviz_file", response_model=DevizResult)
+async def process_deviz_file(file: UploadFile = File(...)):
+    file_bytes = await file.read()
+    content_type = (file.content_type or "").lower()
+    png_bytes = _normalize_to_png_bytes(file_bytes, content_type)
+    return _process_png_bytes(png_bytes)
