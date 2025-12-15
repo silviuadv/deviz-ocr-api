@@ -2,70 +2,39 @@ import os
 import re
 import json
 import base64
-import logging
-from io import BytesIO
-from typing import List, Optional, Dict, Any, Tuple
-
+import math
 import requests
+from io import BytesIO
+from typing import Any, Dict, List, Optional, Tuple
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-
-from PIL import Image
-
-# Optional PDF support (recommended)
-try:
-    import fitz  # PyMuPDF
-except Exception:
-    fitz = None
-
-# Optional OpenAI (fallback)
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
-
-
-# ----------------------------
-# Config + Logging
-# ----------------------------
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("deviz-ocr")
-
-GOOGLE_VISION_API_KEY = os.getenv("GOOGLE_VISION_API_KEY", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o").strip()
-FALLBACK_SCORE_THRESHOLD = float(os.getenv("FALLBACK_SCORE_THRESHOLD", "0.65"))
-
-if not GOOGLE_VISION_API_KEY:
-    log.warning("GOOGLE_VISION_API_KEY is missing. Primary OCR will fail.")
-if not OPENAI_API_KEY:
-    log.warning("OPENAI_API_KEY is missing. Fallback will fail.")
-if OpenAI is None:
-    log.warning("openai package not available. Fallback will fail.")
-
 
 app = FastAPI(title="Deviz Parser Hybrid: Vision Layout Primary + GPT Fallback", version="0.1.0")
 
 
-# ----------------------------
+# =========================
 # Models
-# ----------------------------
+# =========================
+
 class DevizUrlPayload(BaseModel):
-    url: str = Field(..., description="Public URL for the deviz file (png/jpg/pdf).")
+    url: str
 
 
 class ExtractedItem(BaseModel):
-    type: str  # "part" | "labor"
-    description: str
-    qty: float
-    unit: Optional[str] = None
-    unit_price: float
-    line_total: float
+    raw: Optional[str] = ""
+    desc: str = ""
+    kind: str = Field(default="part")  # part / labor
+    qty: float = 0.0
+    unit: str = ""
+    unit_price: float = 0.0
+    line_total: float = 0.0
     currency: str = "RON"
-    warnings: List[str] = []
+    warnings: List[str] = Field(default_factory=list)
 
 
-class ExtractedTotals(BaseModel):
+class Totals(BaseModel):
     materials: Optional[float] = None
     labor: Optional[float] = None
     vat: Optional[float] = None
@@ -74,674 +43,786 @@ class ExtractedTotals(BaseModel):
     currency: str = "RON"
 
 
-class DevizResult(BaseModel):
-    ok: bool = True
-    source: str  # "google_vision" | "gpt_fallback"
-    score: float
+class DocumentMeta(BaseModel):
+    default_currency: str = "RON"
+    service_name: Optional[str] = None
+    client_name: Optional[str] = None
+    vehicle: Optional[str] = None
+    date: Optional[str] = None
+    number: Optional[str] = None
+
+
+class DevizResponse(BaseModel):
+    document: DocumentMeta
+    totals: Totals
     items: List[ExtractedItem]
-    totals: ExtractedTotals
-    debug: Dict[str, Any] = {}
+    warnings: List[str] = Field(default_factory=list)
+    sum_guess_from_lines: Optional[float] = None
+    ocr_text_raw: Optional[str] = None
+    debug: Dict[str, Any] = Field(default_factory=dict)
 
 
-# ----------------------------
-# Helpers: file download + normalize to image bytes
-# ----------------------------
-def _download_bytes(url: str) -> Tuple[bytes, str]:
+# =========================
+# Helpers: numbers, text
+# =========================
+
+def _safe_float(x: Any) -> Optional[float]:
     try:
-        r = requests.get(url, timeout=60, allow_redirects=True)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not download url: {e}")
-
-    if r.status_code >= 400:
-        raise HTTPException(status_code=400, detail=f"Could not download url. HTTP {r.status_code}")
-
-    content_type = (r.headers.get("Content-Type") or "").lower().split(";")[0].strip()
-    return r.content, content_type
-
-
-def _pdf_first_page_to_png_bytes(pdf_bytes: bytes) -> bytes:
-    if fitz is None:
-        raise HTTPException(
-            status_code=400,
-            detail="PDF received but PyMuPDF is not installed. Add 'pymupdf' to requirements.txt."
-        )
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    if doc.page_count < 1:
-        raise HTTPException(status_code=400, detail="Empty PDF.")
-    page = doc.load_page(0)
-    pix = page.get_pixmap(dpi=220, alpha=False)  # decent OCR quality
-    return pix.tobytes("png")
+        if x is None:
+            return None
+        if isinstance(x, (int, float)):
+            return float(x)
+        s = str(x).strip()
+        if not s:
+            return None
+        # Romanian/Euro formats: 1.200,00 or 1200,00
+        s = s.replace(" ", "")
+        if re.search(r"\d,\d{1,2}$", s):
+            s = s.replace(".", "").replace(",", ".")
+        return float(s)
+    except Exception:
+        return None
 
 
-def _normalize_to_png_bytes(file_bytes: bytes, content_type: str) -> bytes:
-    # If PDF -> render first page to PNG
-    if "pdf" in content_type or file_bytes[:4] == b"%PDF":
-        return _pdf_first_page_to_png_bytes(file_bytes)
-
-    # Otherwise try PIL to convert to PNG
-    try:
-        img = Image.open(BytesIO(file_bytes))
-        img = img.convert("RGB")
-        out = BytesIO()
-        img.save(out, format="PNG", optimize=True)
-        return out.getvalue()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Unsupported image format or corrupted file: {e}")
+def _norm_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
 
 
-# ----------------------------
-# Google Vision: call + layout reconstruction
-# ----------------------------
-class _TextWord:
-    __slots__ = ("text", "x", "y", "h")
-    def __init__(self, text: str, x: int, y: int, h: int):
-        self.text = text
+def _contains_any(hay: str, needles: List[str]) -> bool:
+    h = (hay or "").lower()
+    return any(n.lower() in h for n in needles)
+
+
+def _approx_equal(a: Optional[float], b: Optional[float], tol: float = 2.0) -> bool:
+    if a is None or b is None:
+        return False
+    return abs(a - b) <= tol
+
+
+# =========================
+# Google Vision: OCR + layout (words with coords)
+# =========================
+
+class _Word:
+    __slots__ = ("t", "x", "y", "h")
+
+    def __init__(self, t: str, x: int, y: int, h: int):
+        self.t = t
         self.x = x
         self.y = y
         self.h = h
 
 
-def _google_vision_document_text_detection(png_bytes: bytes) -> Dict[str, Any]:
-    if not GOOGLE_VISION_API_KEY:
+def _vision_call(image_bytes: bytes) -> Dict[str, Any]:
+    api_key = os.getenv("GOOGLE_VISION_API_KEY", "").strip()
+    if not api_key:
         raise HTTPException(status_code=500, detail="Server missing GOOGLE_VISION_API_KEY")
 
-    url = f"https://vision.googleapis.com/v1/images:annotate?key={GOOGLE_VISION_API_KEY}"
+    url = f"https://vision.googleapis.com/v1/images:annotate?key={api_key}"
     body = {
         "requests": [{
-            "image": {"content": base64.b64encode(png_bytes).decode("utf-8")},
+            "image": {"content": base64.b64encode(image_bytes).decode("utf-8")},
+            # DOCUMENT_TEXT_DETECTION is better for forms/tables
             "features": [{"type": "DOCUMENT_TEXT_DETECTION"}],
         }]
     }
-    r = requests.post(url, json=body, timeout=90)
-    if r.status_code >= 400:
-        raise HTTPException(status_code=502, detail=f"Google Vision error: {r.status_code} {r.text}")
+    r = requests.post(url, json=body, timeout=60)
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Google Vision error: {r.text}")
     return r.json()
 
 
-def _reconstruct_lines_from_vision(vision_json: Dict[str, Any]) -> List[str]:
-    # Extract words + bounding boxes
-    words: List[_TextWord] = []
-
+def _extract_words_and_raw_text(vision_json: Dict[str, Any]) -> Tuple[List[_Word], str]:
     try:
         resp0 = (vision_json.get("responses") or [])[0] or {}
-        pages = (((resp0.get("fullTextAnnotation") or {}).get("pages")) or [])
-        for page in pages:
-            for block in page.get("blocks", []) or []:
-                for para in block.get("paragraphs", []) or []:
-                    for w in para.get("words", []) or []:
-                        txt = "".join((s.get("text", "") for s in (w.get("symbols", []) or []))).strip()
-                        if not txt:
-                            continue
-                        verts = (((w.get("boundingBox") or {}).get("vertices")) or [])
-                        if len(verts) < 3:
-                            continue
-                        x = int(verts[0].get("x", 0) or 0)
-                        y = int(verts[0].get("y", 0) or 0)
-                        y2 = int(verts[2].get("y", y + 10) or (y + 10))
-                        h = max(6, y2 - y)
-                        words.append(_TextWord(txt, x, y, h))
     except Exception:
-        words = []
+        resp0 = {}
 
+    raw_text = ""
+    try:
+        raw_text = resp0.get("fullTextAnnotation", {}).get("text", "") or ""
+    except Exception:
+        raw_text = ""
+
+    words: List[_Word] = []
+    pages = resp0.get("fullTextAnnotation", {}).get("pages", []) or []
+    for page in pages:
+        for block in page.get("blocks", []) or []:
+            for para in block.get("paragraphs", []) or []:
+                for w in para.get("words", []) or []:
+                    txt = "".join((s.get("text", "") for s in (w.get("symbols", []) or [])))
+                    verts = (w.get("boundingBox", {}) or {}).get("vertices", []) or []
+                    if not verts:
+                        continue
+                    x = int(verts[0].get("x", 0) or 0)
+                    y = int(verts[0].get("y", 0) or 0)
+                    yb = int((verts[2].get("y", y + 10) if len(verts) > 2 else (y + 10)) or (y + 10))
+                    h = max(1, yb - y)
+                    if txt.strip():
+                        words.append(_Word(txt, x, y, h))
+    return words, raw_text
+
+
+def reconstruct_lines_from_words(words: List[_Word]) -> List[str]:
+    # Cluster words by Y then sort by X within each line
     if not words:
-        # fallback to raw text if any
-        resp0 = (vision_json.get("responses") or [])[0] or {}
-        raw = (((resp0.get("fullTextAnnotation") or {}).get("text")) or "").strip()
-        return [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        return []
 
-    # Sort by Y then X for clustering
-    words.sort(key=lambda w: (w.y, w.x))
+    words_sorted = sorted(words, key=lambda w: (w.y, w.x))
+    lines: List[List[_Word]] = []
 
-    lines: List[List[_TextWord]] = []
-    for w in words:
+    for w in words_sorted:
         placed = False
         for line in lines:
             avg_y = sum(x.y for x in line) / len(line)
             avg_h = sum(x.h for x in line) / len(line)
-            if abs(w.y - avg_y) <= max(6.0, avg_h * 0.55):
+            if abs(w.y - avg_y) < (avg_h * 0.55):
                 line.append(w)
                 placed = True
                 break
         if not placed:
             lines.append([w])
 
-    # For each line: sort by X, then add spaces based on gaps (helps stop "zippering")
-    final_lines: List[str] = []
-    for line_words in lines:
-        line_words.sort(key=lambda w: w.x)
-        parts: List[str] = []
-        prev_x = None
-        for ww in line_words:
-            if prev_x is None:
-                parts.append(ww.text)
-                prev_x = ww.x
-                continue
-            gap = ww.x - prev_x
-            if gap > 55:
-                parts.append("   ")
-            elif gap > 25:
-                parts.append("  ")
-            else:
-                parts.append(" ")
-            parts.append(ww.text)
-            prev_x = ww.x
-        txt = "".join(parts).strip()
-        if txt:
-            final_lines.append(txt)
-
-    # A bit of cleanup: remove duplicates that happen sometimes
-    cleaned: List[str] = []
-    last = None
-    for ln in final_lines:
-        if ln == last:
-            continue
-        cleaned.append(ln)
-        last = ln
-    return cleaned
+    out: List[str] = []
+    for line in lines:
+        line = sorted(line, key=lambda w: w.x)
+        out.append(_norm_spaces(" ".join(w.t for w in line)))
+    return [x for x in out if x]
 
 
-# ----------------------------
-# Parsing: extract items + totals from reconstructed lines
-# Works for model 1 (Materiale/Piese + Manopera) and model 2 (Lista materiale + Lista operatiuni)
-# ----------------------------
-_NUM_RE = re.compile(r"^\d{1,3}([.,]\d{3})*([.,]\d+)?$|^\d+([.,]\d+)?$")
+# =========================
+# Parser A (generic lines) - good for Deviz 1/2
+# =========================
 
-def _to_float(s: str) -> Optional[float]:
-    s = (s or "").strip()
-    if not s:
-        return None
-    # "1,070.00" / "1.070,00" / "1070.00" / "1070,00"
-    # heuristic: if both "," and ".", treat the last separator as decimal.
-    if "," in s and "." in s:
-        if s.rfind(",") > s.rfind("."):
-            # 1.070,00
-            s = s.replace(".", "").replace(",", ".")
-        else:
-            # 1,070.00
-            s = s.replace(",", "")
-    else:
-        # single separator
-        if s.count(",") == 1 and s.count(".") == 0:
-            s = s.replace(",", ".")
-        elif s.count(".") > 1 and s.count(",") == 0:
-            s = s.replace(".", "")
-        elif s.count(",") > 1 and s.count(".") == 0:
-            s = s.replace(",", "")
-
-    try:
-        return float(s)
-    except Exception:
-        return None
-
-
-def _extract_trailing_numbers(tokens: List[str]) -> Tuple[List[str], List[float]]:
-    # Walk from end; collect numeric tokens until hit text
+def _split_tail_numbers(line: str) -> Tuple[str, List[float]]:
+    parts = line.split()
     nums: List[float] = []
-    cut = len(tokens)
-    for i in range(len(tokens) - 1, -1, -1):
-        t = tokens[i].strip()
-        if not t:
-            continue
-        tt = t.replace("RON", "").strip()
-        if _NUM_RE.match(tt):
-            v = _to_float(tt)
-            if v is None:
+    # walk from end: collect numeric tokens
+    for p in reversed(parts):
+        clean = p.replace(" ", "")
+        clean2 = clean.replace(".", "").replace(",", ".")
+        if re.fullmatch(r"\d+(\.\d+)?", clean2 or ""):
+            try:
+                nums.insert(0, float(clean2))
+            except Exception:
                 break
-            nums.insert(0, v)
-            cut = i
         else:
             break
-    desc_tokens = tokens[:cut]
-    return desc_tokens, nums
+    desc = " ".join(parts[: max(0, len(parts) - len(nums))])
+    return _norm_spaces(desc), nums
 
 
-def _best_qty_price_total(nums: List[float]) -> Tuple[Optional[float], Optional[float], Optional[float], List[str]]:
-    """
-    Tries to pick qty, unit_price, total from a list of extracted numbers.
-    Usually last 3 are qty, price, total, but zippering can reorder.
-    Returns best guess + warnings.
-    """
-    warnings: List[str] = []
-    if len(nums) < 2:
-        return None, None, None, ["missing_fields"]
-
-    # candidates: pick triples among last up to 5 nums
-    tail = nums[-5:] if len(nums) > 5 else nums[:]
-    best = None
-    best_err = 10**18
-
-    # If exactly 2 nums: assume qty, total OR qty, price; we cannot know total -> treat second as total
-    if len(nums) == 2:
-        qty, second = nums[0], nums[1]
-        # qty should be small-ish; if not, swap
-        if qty > 1000 and second <= 1000:
-            qty, second = second, qty
-        # we treat second as total, and unit_price = total/qty if qty != 0
-        unit_price = (second / qty) if qty else second
-        return qty, unit_price, second, ["derived_unit_price"]
-
-    # brute force choose 3 values from tail (order matters by meaning)
-    # we try mapping (qty, price, total) with constraints
-    candidates = []
-    for i in range(len(tail)):
-        for j in range(len(tail)):
-            for k in range(len(tail)):
-                if len({i, j, k}) != 3:
-                    continue
-                q, p, t = tail[i], tail[j], tail[k]
-                if q <= 0 or p < 0 or t < 0:
-                    continue
-                # qty tends to be <= 1000, price <= 1e7, total <= 1e7
-                if q > 50000:
-                    continue
-                err = abs((q * p) - t)
-                candidates.append((err, q, p, t))
-
-    if not candidates:
-        # fallback: take last three
-        q, p, t = nums[-3], nums[-2], nums[-1]
-        warnings.append("heuristic_last_three")
-        return q, p, t, warnings
-
-    candidates.sort(key=lambda x: x[0])
-    err, q, p, t = candidates[0]
-
-    # Accept if err small, else still return but warn
-    if err > max(1.0, t * 0.03):
-        warnings.append(f"inconsistent_total: qty*unit_price={q*p:.2f} vs total={t:.2f}")
-    return q, p, t, warnings
-
-
-def _detect_section(line_l: str) -> Optional[str]:
-    # model 1
-    if "manopera" == line_l.strip():
-        return "labor"
-    if "materiale/piese" in line_l or "materiale" == line_l.strip() or "piese" == line_l.strip():
-        return "part"
-
-    # model 2
-    if "lista materiale" in line_l:
-        return "part"
-    if "lista operatiuni" in line_l or "lista opera" in line_l:
-        return "labor"
-
-    return None
-
-
-def _should_skip_noise(line_l: str) -> bool:
-    noise = [
-        "c.i.f", "nr ord reg com", "adresa:", "judet:", "telefon:",
-        "date client", "date produs", "serie de sasiu", "numar inmatriculare",
-        "pagina", "garantie", "lucrarile au fost", "in conformitate", "hg ",
-        "subtotal", "total materiale", "total manopera", "total deviz", "tva"
-    ]
-    return any(n in line_l for n in noise)
-
-
-def _parse_lines_to_items_and_totals(lines: List[str]) -> Tuple[List[ExtractedItem], ExtractedTotals, Dict[str, Any]]:
+def parse_generic_lines(lines: List[str], currency: str = "RON") -> List[ExtractedItem]:
     items: List[ExtractedItem] = []
-    totals = ExtractedTotals(currency="RON")
-    debug: Dict[str, Any] = {"lines_used": 0, "section": None, "found_totals": {}}
 
-    current_section: Optional[str] = None
-
-    # Totals patterns (both models)
-    re_total_deviz = re.compile(r"\btotal\s+deviz\b", re.IGNORECASE)
-    re_total_cu_tva = re.compile(r"\btotal\s+cu\s+tva\b", re.IGNORECASE)
-    re_total_materiale = re.compile(r"\btotal\s+materiale\b", re.IGNORECASE)
-    re_total_manopera = re.compile(r"\btotal\s+manopera\b", re.IGNORECASE)
-    re_subtotal_ftva = re.compile(r"\bsubtotal\b.*\bf\.?tva\b", re.IGNORECASE)
-    re_tva = re.compile(r"\btva\b", re.IGNORECASE)
-
-    for raw in lines:
-        line = (raw or "").strip()
-        if not line:
+    noise = ["pagina", "total deviz", "total materiale", "total manopera", "lucrarile", "perioada", "certificat", "garantie"]
+    for line in lines:
+        l = _norm_spaces(line)
+        if len(l) < 4:
             continue
-        line_l = line.lower().strip()
-
-        sec = _detect_section(line_l)
-        if sec:
-            current_section = sec
-            debug["section"] = current_section
+        if _contains_any(l, noise):
             continue
 
-        # totals lines
-        # (some PDFs put numbers on next line; we handle same-line first)
-        def grab_last_number(s: str) -> Optional[float]:
-            toks = s.replace(":", " ").split()
-            _, nums = _extract_trailing_numbers(toks)
-            return nums[-1] if nums else None
-
-        if re_total_deviz.search(line_l):
-            v = grab_last_number(line)
-            if v is not None:
-                totals.grand_total = v
-                debug["found_totals"]["grand_total"] = v
-            continue
-
-        if re_total_cu_tva.search(line_l):
-            v = grab_last_number(line)
-            if v is not None:
-                totals.grand_total = v
-                debug["found_totals"]["grand_total"] = v
-            continue
-
-        if re_total_materiale.search(line_l):
-            v = grab_last_number(line)
-            if v is not None:
-                totals.materials = v
-                debug["found_totals"]["materials"] = v
-            continue
-
-        if re_total_manopera.search(line_l):
-            v = grab_last_number(line)
-            if v is not None:
-                totals.labor = v
-                debug["found_totals"]["labor"] = v
-            continue
-
-        if re_subtotal_ftva.search(line_l):
-            v = grab_last_number(line)
-            if v is not None:
-                totals.subtotal_no_vat = v
-                debug["found_totals"]["subtotal_no_vat"] = v
-            continue
-
-        # A single TVA line sometimes exists with value
-        if re_tva.fullmatch(line_l.strip(" :")) or line_l.startswith("tva"):
-            v = grab_last_number(line)
-            if v is not None:
-                totals.vat = v
-                debug["found_totals"]["vat"] = v
-            continue
-
-        if _should_skip_noise(line_l):
-            continue
-
-        # Parse table row candidates: must have numbers
-        tokens = line.replace("\t", " ").split()
-        desc_tokens, nums = _extract_trailing_numbers(tokens)
+        desc, nums = _split_tail_numbers(l)
         if len(nums) < 2:
             continue
 
-        desc = " ".join(desc_tokens).strip()
-        desc = re.sub(r"^\d+\.?\s*", "", desc)  # remove "1." etc
+        # heuristics:
+        # if 3 numbers and qty*unit ~= total -> (qty, unit, total)
+        qty = nums[0]
+        unit_price = nums[1]
+        line_total = nums[-1]
 
-        # If section not set, guess based on keywords
-        typ = current_section
-        if not typ:
-            if "manopera" in line_l:
-                typ = "labor"
+        if len(nums) >= 3:
+            q, p, t = nums[-3], nums[-2], nums[-1]
+            if abs((q * p) - t) <= 2.0:
+                qty, unit_price, line_total = q, p, t
             else:
-                typ = "part"
+                # if only qty+price and no total, derive
+                if len(nums) == 2:
+                    line_total = qty * unit_price
 
-        # For labor lines, remove leading "manopera"
-        if typ == "labor":
-            desc = re.sub(r"^manopera\s+", "", desc, flags=re.IGNORECASE).strip()
+        kind = "part"
+        unit = ""
+        dlow = desc.lower()
+        if "manopera" in dlow:
+            kind = "labor"
+            unit = "ore"
+            desc = re.sub(r"(?i)\bmanopera\b", "", desc).strip()
 
-        # Guess unit
-        unit = None
-        # common: BUC, h, ore
-        if re.search(r"\b(buc|h|ore)\b", line_l):
-            m = re.search(r"\b(buc|h|ore)\b", line_l)
-            unit = m.group(1) if m else None
-            if unit == "h":
-                unit = "ore"
-            if unit == "buc":
-                unit = "buc"
-
-        qty, unit_price, total, warns = _best_qty_price_total(nums)
-        if qty is None or unit_price is None or total is None:
-            continue
-
-        # A VERY common zippering in labor: qty and price swapped or extra numbers from header
-        # Fix: if qty looks like a price and unit_price looks like qty, swap if it improves consistency
-        if typ == "labor":
-            # qty should be small (hours)
-            if qty > 50 and unit_price <= 50:
-                # try swap
-                new_qty, new_price = unit_price, qty
-                if abs((new_qty * new_price) - total) < abs((qty * unit_price) - total):
-                    qty, unit_price = new_qty, new_price
-                    warns.append("swapped_qty_price")
-
-            # Another case: extracted total is actually qty (like 3.0) and total is elsewhere
-            # If total is tiny and qty*price is big, assume total should be qty*price
-            if total <= 10 and (qty * unit_price) >= 50:
-                warns.append("fixed_total_as_qty_price")
-                total = round(qty * unit_price, 2)
-
-        # If still inconsistent but we can derive total from qty*price and it's close to known totals, fix it
-        if any(w.startswith("inconsistent_total") for w in warns):
-            derived = round(qty * unit_price, 2)
-            # if derived looks plausible, and current total is suspicious
-            if derived > 0 and (abs(derived - total) > max(1.0, derived * 0.03)):
-                # keep warning, do not overwrite by default
-                pass
-
-        if len(desc) < 2:
+        # strip leading item index like "1."
+        desc = re.sub(r"^\d+\.?\s*", "", desc).strip()
+        if not desc:
             continue
 
         items.append(ExtractedItem(
-            type="labor" if typ == "labor" else "part",
-            description=desc,
-            qty=float(qty),
+            raw=l,
+            desc=desc,
+            kind=kind,
+            qty=float(qty or 0.0),
             unit=unit,
-            unit_price=float(unit_price),
-            line_total=float(total),
-            currency="RON",
-            warnings=warns
-        ))
-        debug["lines_used"] += 1
-
-    # Post totals: if not found, compute from items
-    parts_sum = round(sum(i.line_total for i in items if i.type == "part"), 2) if items else 0.0
-    labor_sum = round(sum(i.line_total for i in items if i.type == "labor"), 2) if items else 0.0
-    if totals.materials is None and parts_sum > 0:
-        totals.materials = parts_sum
-    if totals.labor is None and labor_sum > 0:
-        totals.labor = labor_sum
-    if totals.grand_total is None and (parts_sum + labor_sum) > 0:
-        totals.grand_total = round(parts_sum + labor_sum, 2)
-
-    return items, totals, debug
-
-
-def _score_extraction(items: List[ExtractedItem], totals: ExtractedTotals) -> float:
-    if not items:
-        return 0.0
-
-    # Consistency ratio
-    consistent = 0
-    for it in items:
-        if abs((it.qty * it.unit_price) - it.line_total) <= max(1.0, it.line_total * 0.03):
-            consistent += 1
-    ratio_consistent = consistent / max(1, len(items))
-
-    # Has both sections?
-    has_part = any(i.type == "part" for i in items)
-    has_labor = any(i.type == "labor" for i in items)
-    ratio_sections = 1.0 if (has_part and has_labor) else 0.6 if (has_part or has_labor) else 0.0
-
-    # Totals plausibility
-    sum_items = round(sum(i.line_total for i in items), 2)
-    total_score = 0.7
-    if totals.grand_total is not None and sum_items > 0:
-        diff = abs(totals.grand_total - sum_items)
-        total_score = 1.0 if diff <= max(2.0, totals.grand_total * 0.03) else 0.5
-
-    score = 0.55 * ratio_consistent + 0.25 * ratio_sections + 0.20 * total_score
-    return round(float(score), 4)
-
-
-# ----------------------------
-# GPT fallback: Vision-to-JSON
-# ----------------------------
-_FALLBACK_SCHEMA = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "items": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "type": {"type": "string", "enum": ["part", "labor"]},
-                    "description": {"type": "string"},
-                    "qty": {"type": "number"},
-                    "unit": {"type": ["string", "null"]},
-                    "unit_price": {"type": "number"},
-                    "line_total": {"type": "number"},
-                    "currency": {"type": "string"}
-                },
-                "required": ["type", "description", "qty", "unit_price", "line_total", "currency"]
-            }
-        },
-        "totals": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "materials": {"type": ["number", "null"]},
-                "labor": {"type": ["number", "null"]},
-                "vat": {"type": ["number", "null"]},
-                "subtotal_no_vat": {"type": ["number", "null"]},
-                "grand_total": {"type": ["number", "null"]},
-                "currency": {"type": "string"}
-            },
-            "required": ["currency"]
-        }
-    },
-    "required": ["items", "totals"]
-}
-
-
-def _gpt_fallback_parse(png_bytes: bytes) -> Tuple[List[ExtractedItem], ExtractedTotals, Dict[str, Any]]:
-    if OpenAI is None:
-        raise HTTPException(status_code=500, detail="openai package not installed on server")
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=500, detail="Server missing OPENAI_API_KEY")
-
-    client = OpenAI(api_key=OPENAI_API_KEY)
-
-    b64 = base64.b64encode(png_bytes).decode("utf-8")
-    prompt = (
-        "Extract structured data from this Romanian auto repair estimate/invoice (deviz). "
-        "Return ONLY valid JSON matching the provided schema. "
-        "Rules: items must be split into part vs labor. qty, unit_price, line_total must be numeric. "
-        "If unit is shown as BUC use 'buc', if shown as 'h' or 'ore' use 'ore'. Currency RON."
-    )
-
-    # Using Responses API style
-    resp = client.responses.create(
-        model=OPENAI_MODEL,
-        input=[{
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": prompt},
-                {"type": "input_image", "image_url": f"data:image/png;base64,{b64}"}
-            ]
-        }],
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": "deviz_extract",
-                "schema": _FALLBACK_SCHEMA,
-                "strict": True
-            }
-        }
-    )
-
-    out_text = resp.output_text
-    try:
-        data = json.loads(out_text)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"GPT fallback returned invalid JSON: {e}")
-
-    items = []
-    for it in data.get("items", []):
-        items.append(ExtractedItem(
-            type=it["type"],
-            description=it["description"],
-            qty=float(it["qty"]),
-            unit=it.get("unit"),
-            unit_price=float(it["unit_price"]),
-            line_total=float(it["line_total"]),
-            currency=it.get("currency") or "RON",
+            unit_price=float(unit_price or 0.0),
+            line_total=float(line_total or 0.0),
+            currency=currency,
             warnings=[]
         ))
 
-    t = data.get("totals") or {}
-    totals = ExtractedTotals(
-        materials=t.get("materials"),
-        labor=t.get("labor"),
-        vat=t.get("vat"),
-        subtotal_no_vat=t.get("subtotal_no_vat"),
-        grand_total=t.get("grand_total"),
-        currency=t.get("currency") or "RON"
-    )
-
-    return items, totals, {"gpt_model": OPENAI_MODEL}
+    return items
 
 
-# ----------------------------
-# Orchestrator
-# ----------------------------
-def _process_png_bytes(png_bytes: bytes) -> DevizResult:
-    vision_json = _google_vision_document_text_detection(png_bytes)
-    lines = _reconstruct_lines_from_vision(vision_json)
+# =========================
+# Parser B (column/table aware) - for Deviz 3 style (operation + material in same row)
+# =========================
 
-    items, totals, debug = _parse_lines_to_items_and_totals(lines)
-    score = _score_extraction(items, totals)
+def _detect_autodeviz_table(lines: List[str]) -> bool:
+    # typical headers: "LUCRARI CONVENITE..." and columns "OPERATIE" "Material" "Timp" "Val"
+    joined = "\n".join(lines[:200]).lower()
+    return ("operatie" in joined and "material" in joined and "timp" in joined and "u.m" in joined) or ("lucrari convenite" in joined)
 
-    debug["score_components"] = {
-        "items_count": len(items),
-        "grand_total": totals.grand_total,
+
+def _cluster_lines_with_words(words: List[_Word]) -> List[List[_Word]]:
+    if not words:
+        return []
+    words_sorted = sorted(words, key=lambda w: (w.y, w.x))
+    lines: List[List[_Word]] = []
+    for w in words_sorted:
+        placed = False
+        for line in lines:
+            avg_y = sum(x.y for x in line) / len(line)
+            avg_h = sum(x.h for x in line) / len(line)
+            if abs(w.y - avg_y) < (avg_h * 0.55):
+                line.append(w)
+                placed = True
+                break
+        if not placed:
+            lines.append([w])
+    for line in lines:
+        line.sort(key=lambda w: w.x)
+    return lines
+
+
+def _line_text(line_words: List[_Word]) -> str:
+    return _norm_spaces(" ".join(w.t for w in line_words))
+
+
+def _parse_autodeviz_rows(words: List[_Word], currency: str = "RON") -> List[ExtractedItem]:
+    """
+    AutoDeviz-like table:
+    Cod | OPERATIE | Timp h | Val Lei | Material | Cant | U.M. | P.U. Lei | Val Lei
+    We create:
+      - labor item for operation using (Timp h, Val Lei labor)
+      - part item for material using (Cant, U.M., P.U., Val Lei material) when material present
+    """
+    lines_words = _cluster_lines_with_words(words)
+
+    # find header line index
+    header_idx = None
+    for i, lw in enumerate(lines_words):
+        t = _line_text(lw).lower()
+        if "operatie" in t and ("material" in t or "cant" in t) and ("timp" in t or "val" in t):
+            header_idx = i
+            break
+    if header_idx is None:
+        # fallback: find "LUCRARI CONVENITE" then next ~lines contain table
+        for i, lw in enumerate(lines_words):
+            t = _line_text(lw).lower()
+            if "lucrari convenite" in t:
+                header_idx = i
+                break
+    if header_idx is None:
+        return []
+
+    # we parse following lines until we hit totals/footer
+    items: List[ExtractedItem] = []
+
+    def token_is_num(tok: str) -> bool:
+        c = tok.replace(".", "").replace(",", ".")
+        return bool(re.fullmatch(r"\d+(\.\d+)?", c))
+
+    def tok_float(tok: str) -> Optional[float]:
+        return _safe_float(tok)
+
+    stop_markers = [
+        "total manopera", "total materiale", "total reparatie", "cost reparatie",
+        "certificat", "preturile nu contin", "executant", "verificat"
+    ]
+
+    for lw in lines_words[header_idx + 1:]:
+        text = _line_text(lw)
+        low = text.lower()
+        if not text:
+            continue
+        if any(m in low for m in stop_markers):
+            break
+
+        # must start with code like 0101 / 0036 etc OR look like a row with numbers
+        tokens = text.split()
+        if not tokens:
+            continue
+
+        starts_like_code = bool(re.fullmatch(r"\d{3,4}", tokens[0])) or bool(re.fullmatch(r"\d{4}", tokens[0]))
+        has_many_nums = sum(1 for t in tokens if token_is_num(t)) >= 2
+        if not (starts_like_code or has_many_nums):
+            continue
+
+        # Strategy: pick out numeric fields by scanning tokens left->right.
+        # For this table, typical sequence after operation words:
+        # time_h, labor_val, material_words..., qty, um, unit_price, material_val
+        #
+        # We'll:
+        # 1) identify first two numeric tokens after code as time_h and labor_val (usually small time then int val)
+        # 2) then last 4 tokens often represent qty, um, unit_price, material_val (but um is not numeric)
+        #
+        code = tokens[0] if starts_like_code else ""
+
+        # remove code
+        rest = tokens[1:] if starts_like_code else tokens[:]
+
+        # find first numeric = time_h, second numeric = labor_val
+        num_positions = [(idx, t) for idx, t in enumerate(rest) if token_is_num(t)]
+        if len(num_positions) < 2:
+            continue
+
+        i_time, tok_time = num_positions[0]
+        i_lval, tok_lval = num_positions[1]
+
+        time_h = tok_float(tok_time) or 0.0
+        labor_val = tok_float(tok_lval) or 0.0
+
+        op_tokens = rest[:i_time]
+        operation = _norm_spaces(" ".join(op_tokens)).strip(' "')
+        if not operation:
+            operation = "operatie"
+
+        # now parse material tail:
+        # look from end for material_val numeric; preceding numeric is unit_price; preceding token is UM; preceding numeric is qty
+        material_val = None
+        unit_price = None
+        qty = None
+        um = ""
+
+        # scan from end
+        # pick last numeric as material_val
+        tail_nums = [(idx, t) for idx, t in enumerate(rest) if token_is_num(t)]
+        # material_val is usually the last numeric on row
+        if tail_nums:
+            idx_mv, tok_mv = tail_nums[-1]
+            material_val = tok_float(tok_mv)
+
+        # unit_price: numeric before last numeric (if exists)
+        if len(tail_nums) >= 2:
+            idx_up, tok_up = tail_nums[-2]
+            unit_price = tok_float(tok_up)
+
+        # qty: numeric before unit_price (if exists)
+        if len(tail_nums) >= 3:
+            idx_q, tok_q = tail_nums[-3]
+            qty = tok_float(tok_q)
+
+        # UM: token between qty and unit_price (usually right after qty)
+        if qty is not None and unit_price is not None:
+            # find position of qty token in rest (last occurrence)
+            qty_pos = None
+            for idx, t in reversed(list(enumerate(rest))):
+                if token_is_num(t) and _approx_equal(tok_float(t), qty, tol=0.0001):
+                    qty_pos = idx
+                    break
+            if qty_pos is not None and qty_pos + 1 < len(rest):
+                um_candidate = rest[qty_pos + 1]
+                # avoid numeric
+                if not token_is_num(um_candidate):
+                    um = um_candidate
+
+        # material description: between labor_val and qty_pos (or to end if no material fields)
+        mat_desc = ""
+        if qty is not None:
+            # locate qty position again robustly: use first occurrence of that exact token after labor_val
+            qty_pos2 = None
+            for idx in range(i_lval + 1, len(rest)):
+                if token_is_num(rest[idx]) and _approx_equal(tok_float(rest[idx]), qty, tol=0.0001):
+                    qty_pos2 = idx
+                    break
+            if qty_pos2 is not None:
+                mat_tokens = rest[i_lval + 1: qty_pos2]
+                mat_desc = _norm_spaces(" ".join(mat_tokens)).strip(' "')
+        else:
+            # no material part
+            mat_desc = ""
+
+        # create labor item
+        labor_unit_price = 0.0
+        labor_warnings: List[str] = []
+        if time_h > 0 and labor_val > 0:
+            labor_unit_price = labor_val / time_h
+        else:
+            labor_warnings.append("missing_labor_time_or_value")
+
+        items.append(ExtractedItem(
+            raw=text,
+            desc=operation,
+            kind="labor",
+            qty=float(time_h or 0.0),
+            unit="ore",
+            unit_price=float(labor_unit_price or 0.0),
+            line_total=float(labor_val or 0.0),
+            currency=currency,
+            warnings=labor_warnings
+        ))
+
+        # create material item if present and qty+unit_price+material_val look valid and mat_desc not empty
+        if mat_desc and qty is not None and unit_price is not None and material_val is not None:
+            part_warnings: List[str] = []
+            # verify math
+            if abs((qty * unit_price) - material_val) > 2.0:
+                part_warnings.append("derived_unit_price_or_total_mismatch")
+
+            items.append(ExtractedItem(
+                raw=text,
+                desc=mat_desc,
+                kind="part",
+                qty=float(qty or 0.0),
+                unit=um or "",
+                unit_price=float(unit_price or 0.0),
+                line_total=float(material_val or 0.0),
+                currency=currency,
+                warnings=part_warnings
+            ))
+
+    return items
+
+
+# =========================
+# Totals extraction from raw text (quick heuristics)
+# =========================
+
+def _extract_totals_from_text(raw_text: str) -> Totals:
+    t = (raw_text or "")
+    low = t.lower()
+
+    def find_money(patterns: List[str]) -> Optional[float]:
+        for pat in patterns:
+            m = re.search(pat, t, flags=re.IGNORECASE)
+            if m:
+                val = _safe_float(m.group(1))
+                if val is not None:
+                    return val
+        return None
+
+    totals = Totals(currency="RON")
+
+    # common Romanian totals
+    totals.materials = find_money([
+        r"TOTAL\s+MATERIALE\s*[:\-]?\s*([\d\.\,]+)",
+        r"Total\s+materiale\s*[:\-]?\s*([\d\.\,]+)",
+    ])
+    totals.labor = find_money([
+        r"TOTAL\s+MANOPERA\s*[:\-]?\s*([\d\.\,]+)",
+        r"Total\s+manopera\s*[:\-]?\s*([\d\.\,]+)",
+    ])
+    totals.grand_total = find_money([
+        r"TOTAL\s+DEVIZ\s*[:\-]?\s*([\d\.\,]+)",
+        r"TOTAL\s+REPARATIE\s*[:\-]?\s*([\d\.\,]+)",
+        r"Total\s+cu\s+TVA\s*[:\-]?\s*([\d\.\,]+)",
+    ])
+
+    # currency
+    cur = "RON"
+    if "lei" in low:
+        cur = "RON"
+    if "ron" in low:
+        cur = "RON"
+    totals.currency = cur
+    return totals
+
+
+# =========================
+# OpenAI fallback (GPT-4o)
+# =========================
+
+def _openai_fallback(image_bytes: bytes, raw_text: str) -> DevizResponse:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(status_code=500, detail="Server missing OPENAI_API_KEY")
+
+    model = os.getenv("OPENAI_MODEL", "gpt-4o").strip() or "gpt-4o"
+
+    # Keep schema simple + stable for Make mapping
+    schema = {
+        "type": "object",
+        "properties": {
+            "document": {
+                "type": "object",
+                "properties": {
+                    "default_currency": {"type": "string"},
+                    "service_name": {"type": ["string", "null"]},
+                    "client_name": {"type": ["string", "null"]},
+                    "vehicle": {"type": ["string", "null"]},
+                    "date": {"type": ["string", "null"]},
+                    "number": {"type": ["string", "null"]},
+                },
+                "required": ["default_currency"]
+            },
+            "totals": {
+                "type": "object",
+                "properties": {
+                    "materials": {"type": ["number", "null"]},
+                    "labor": {"type": ["number", "null"]},
+                    "vat": {"type": ["number", "null"]},
+                    "subtotal_no_vat": {"type": ["number", "null"]},
+                    "grand_total": {"type": ["number", "null"]},
+                    "currency": {"type": "string"},
+                },
+                "required": ["currency"]
+            },
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "raw": {"type": ["string", "null"]},
+                        "desc": {"type": "string"},
+                        "kind": {"type": "string"},
+                        "qty": {"type": "number"},
+                        "unit": {"type": "string"},
+                        "unit_price": {"type": "number"},
+                        "line_total": {"type": "number"},
+                        "currency": {"type": "string"},
+                        "warnings": {"type": "array", "items": {"type": "string"}}
+                    },
+                    "required": ["desc", "kind", "qty", "unit", "unit_price", "line_total", "currency", "warnings"]
+                }
+            },
+            "warnings": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["document", "totals", "items", "warnings"]
     }
-    debug["preview_lines"] = lines[:40]  # for debug, safe to keep some
 
-    if score < FALLBACK_SCORE_THRESHOLD:
-        log.info(f"Score {score} below threshold {FALLBACK_SCORE_THRESHOLD}, using GPT fallback.")
-        fb_items, fb_totals, fb_debug = _gpt_fallback_parse(png_bytes)
-        fb_score = _score_extraction(fb_items, fb_totals)
+    # OpenAI Responses API (image + text)
+    # image as base64 data url
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    image_url = f"data:image/png;base64,{b64}"
 
-        return DevizResult(
-            ok=True,
-            source="gpt_fallback",
-            score=fb_score,
-            items=fb_items,
-            totals=fb_totals,
-            debug={"primary_score": score, "threshold": FALLBACK_SCORE_THRESHOLD, **fb_debug}
-        )
-
-    return DevizResult(
-        ok=True,
-        source="google_vision",
-        score=score,
-        items=items,
-        totals=totals,
-        debug=debug
+    prompt = (
+        "Extrage date structurate dintr-un deviz auto in format JSON.\n"
+        "Vreau sa returnezi:\n"
+        "- items: fiecare linie din manopera si piese (kind = 'labor' sau 'part')\n"
+        "- totals: materials, labor, grand_total, currency (RON)\n"
+        "- document: service_name, client_name, vehicle, date, number daca se vad\n"
+        "Reguli:\n"
+        "- Nu inventa valori. Daca lipseste ceva, pune null sau 0 unde e numeric.\n"
+        "- Pastreaza cantitatile si totalurile exact cum apar.\n"
+        "- Daca un rand contine si operatie si material (tabel combinat), creeaza 2 items: unul labor (operatie) si unul part (material).\n"
     )
 
+    req = {
+        "model": model,
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {"type": "input_image", "image_url": image_url},
+                    # raw_text helps if image is slightly noisy
+                    {"type": "input_text", "text": "OCR raw text (optional context):\n" + (raw_text or "")[:8000]},
+                ],
+            }
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "deviz_schema",
+                "schema": schema
+            }
+        }
+    }
 
-# ----------------------------
+    r = requests.post(
+        "https://api.openai.com/v1/responses",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        data=json.dumps(req),
+        timeout=90
+    )
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"OpenAI error: {r.text}")
+
+    data = r.json()
+    # responses output text is in output[0].content[0].text typically
+    out_text = None
+    try:
+        for o in data.get("output", []):
+            for c in o.get("content", []):
+                if c.get("type") == "output_text":
+                    out_text = c.get("text")
+                    break
+            if out_text:
+                break
+    except Exception:
+        out_text = None
+
+    if not out_text:
+        raise HTTPException(status_code=502, detail="OpenAI returned empty output_text")
+
+    parsed = json.loads(out_text)
+
+    # normalize into DevizResponse
+    resp = DevizResponse(
+        document=DocumentMeta(**parsed.get("document", {}) or {"default_currency": "RON"}),
+        totals=Totals(**parsed.get("totals", {}) or {"currency": "RON"}),
+        items=[ExtractedItem(**it) for it in (parsed.get("items") or [])],
+        warnings=parsed.get("warnings") or [],
+        sum_guess_from_lines=None,
+        ocr_text_raw=raw_text,
+        debug={"used_parser": "openai_fallback", "fallback_used": True}
+    )
+    return resp
+
+
+# =========================
+# Scoring + orchestrator
+# =========================
+
+def _score_result(resp: DevizResponse) -> Tuple[bool, List[str]]:
+    reasons: List[str] = []
+    items = resp.items or []
+
+    if len(items) < 2:
+        reasons.append("too_few_items")
+
+    gt = resp.totals.grand_total
+    if gt is None or gt <= 0:
+        reasons.append("missing_grand_total")
+
+    # If we have both materials & labor totals, check sum
+    m = resp.totals.materials
+    l = resp.totals.labor
+    if gt and m is not None and l is not None:
+        if abs((m + l) - gt) > 10.0:
+            reasons.append("totals_mismatch_gt_vs_m_plus_l")
+
+    # Also check if too many derived warnings
+    warn_count = sum(1 for it in items for w in (it.warnings or []) if "derived" in w or "mismatch" in w)
+    if len(items) > 0 and (warn_count / max(1, len(items))) > 0.7:
+        reasons.append("too_many_derived_warnings")
+
+    ok = len(reasons) == 0
+    return ok, reasons
+
+
+def _build_response_from_primary(words: List[_Word], raw_text: str) -> DevizResponse:
+    currency = "RON"
+    totals = _extract_totals_from_text(raw_text)
+    currency = totals.currency or "RON"
+
+    lines = reconstruct_lines_from_words(words)
+    items: List[ExtractedItem] = []
+
+    used_parser = "generic_lines"
+
+    if _detect_autodeviz_table(lines):
+        # try table-aware parser first for Deviz 3 style
+        items_tbl = _parse_autodeviz_rows(words, currency=currency)
+        if len(items_tbl) >= 2:
+            items = items_tbl
+            used_parser = "autodeviz_table"
+        else:
+            items = parse_generic_lines(lines, currency=currency)
+            used_parser = "generic_lines"
+    else:
+        items = parse_generic_lines(lines, currency=currency)
+        used_parser = "generic_lines"
+
+    # sum guess from items
+    sum_guess = sum((it.line_total or 0.0) for it in items) if items else None
+
+    # fill totals from items if missing
+    if totals.materials is None:
+        totals.materials = sum((it.line_total or 0.0) for it in items if it.kind == "part") if items else None
+    if totals.labor is None:
+        totals.labor = sum((it.line_total or 0.0) for it in items if it.kind == "labor") if items else None
+    if totals.grand_total is None and totals.materials is not None and totals.labor is not None:
+        totals.grand_total = (totals.materials or 0.0) + (totals.labor or 0.0)
+
+    doc = DocumentMeta(default_currency=currency)
+
+    resp = DevizResponse(
+        document=doc,
+        totals=totals,
+        items=items,
+        warnings=[],
+        sum_guess_from_lines=sum_guess,
+        ocr_text_raw=raw_text,
+        debug={
+            "used_parser": used_parser,
+            "fallback_used": False,
+            "lines_used": len(lines),
+            "preview_lines": lines[:5],
+        }
+    )
+    return resp
+
+
+def _process_image(image_bytes: bytes) -> DevizResponse:
+    vision_json = _vision_call(image_bytes)
+    words, raw_text = _extract_words_and_raw_text(vision_json)
+
+    if not words and not raw_text:
+        raise HTTPException(status_code=502, detail="Google Vision returned empty result")
+
+    primary = _build_response_from_primary(words, raw_text)
+    ok, reasons = _score_result(primary)
+
+    threshold = float(os.getenv("FALLBACK_SCORE_THRESHOLD", "1").strip() or "1")
+    # threshold here is simple: if primary not ok -> fallback
+    need_fallback = (not ok) and threshold >= 1
+
+    if need_fallback:
+        fb = _openai_fallback(image_bytes=image_bytes, raw_text=raw_text)
+        fb.warnings = (fb.warnings or []) + ["fallback_used_due_to: " + ",".join(reasons)]
+        fb.debug = fb.debug or {}
+        fb.debug.update({
+            "primary_failed_reasons": reasons,
+            "primary_used_parser": primary.debug.get("used_parser"),
+        })
+        return fb
+
+    if not ok:
+        # keep primary, but tell user why it might be weak
+        primary.warnings = (primary.warnings or []) + ["primary_low_confidence: " + ",".join(reasons)]
+
+    return primary
+
+
+# =========================
+# Download helper for URL endpoint
+# =========================
+
+def _download_file(url: str) -> bytes:
+    # Airtable attachment URLs are usually direct and time-limited. Use GET.
+    r = requests.get(url, timeout=60)
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Failed to download file: {r.status_code}")
+    return r.content
+
+
+# =========================
 # Routes
-# ----------------------------
+# =========================
+
 @app.get("/health")
 def health():
     return {"ok": True}
 
 
-@app.post("/process_deviz_url", response_model=DevizResult)
+@app.post("/process_deviz_url", response_model=DevizResponse)
 def process_deviz_url(payload: DevizUrlPayload):
-    file_bytes, content_type = _download_bytes(payload.url)
-    png_bytes = _normalize_to_png_bytes(file_bytes, content_type)
-    return _process_png_bytes(png_bytes)
+    image_bytes = _download_file(payload.url)
+    # if PDF: you can extend later; for now assume PNG/JPG
+    return _process_image(image_bytes)
 
 
-@app.post("/process_deviz_file", response_model=DevizResult)
+@app.post("/process_deviz_file", response_model=DevizResponse)
 async def process_deviz_file(file: UploadFile = File(...)):
-    file_bytes = await file.read()
-    content_type = (file.content_type or "").lower()
-    png_bytes = _normalize_to_png_bytes(file_bytes, content_type)
-    return _process_png_bytes(png_bytes)
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty file")
+    return _process_image(data)
