@@ -318,16 +318,20 @@ def parse_material_table_zip(section_lines: List[str], default_currency: str) ->
 
 def parse_labor_table_zip(section_lines: List[str], default_currency: str) -> List[Dict[str, Any]]:
     """
-    Model 2 labor is often OCR'ed COLUMN-WISE:
-      units: h, h
-      qty:   3.00, 3.00
-      price: 90.00, 60.00
-      value: 270.00, 180.00
-    We build rows by columns using n = number of 'Manopera ...' lines.
+    Model 2 labor often OCRs as a STREAM:
+      h
+      3.00
+      90.00
+      h
+      3.00
+      60.00
+      270.00
+      180.00
+    We pair each 'Manopera ...' description with the next (unit, qty, price, value)
+    in sequence.
     """
     descs: List[str] = []
-    units: List[str] = []
-    nums: List[float] = []
+    stream: List[Any] = []  # mix of "UNIT" tokens + float numbers
 
     in_table = False
 
@@ -338,11 +342,8 @@ def parse_labor_table_zip(section_lines: List[str], default_currency: str) -> Li
 
         if "total deviz" in nr:
             break
-        if "total materiale" in nr or "total manopera" in nr:
-            # totals are NOT line items
-            continue
 
-        # detect header and start table
+        # start when we see the header (U.M / Cantitate etc)
         if ("u.m" in nr or "u/m" in nr) and ("cantitate" in nr or "cantit" in nr):
             in_table = True
             continue
@@ -355,35 +356,49 @@ def parse_labor_table_zip(section_lines: List[str], default_currency: str) -> Li
         if not in_table:
             continue
 
-        # units (h / ore)
+        # unit tokens
         if nr.strip() in {"h", "ora", "ore"}:
-            units.append("ore")
+            stream.append("UNIT")
             continue
 
-        # numeric-only values (qty/price/value)
+        # numeric-only
         if NUM_ONLY_RE.match(nr):
-            nums.append(float(nr))
+            stream.append(float(nr))
             continue
 
-    n = len(descs)
-    if n == 0:
-        return []
+        # ignore totals/subtotals text
+        if "total materiale" in nr or "total manopera" in nr:
+            continue
 
-    # We need at least 3*n numeric values: qty(n) + price(n) + value(n)
-    # If OCR includes extra numbers, we take the first 3*n.
-    if len(nums) < 3 * n:
+    if not descs:
         return []
-
-    qty_col = nums[0:n]
-    price_col = nums[n:2*n]
-    value_col = nums[2*n:3*n]
 
     items: List[Dict[str, Any]] = []
-    for i in range(n):
-        qty = qty_col[i]
-        unit_price = price_col[i]
-        line_total = value_col[i]
-        raw_desc = descs[i]
+
+    idx = 0  # pointer in stream
+    for raw_desc in descs:
+        # find next UNIT
+        while idx < len(stream) and stream[idx] != "UNIT":
+            idx += 1
+        if idx >= len(stream):
+            break
+        idx += 1  # consume UNIT
+
+        # expect qty, price
+        if idx + 1 >= len(stream) or not isinstance(stream[idx], float) or not isinstance(stream[idx + 1], float):
+            break
+        qty = float(stream[idx]); unit_price = float(stream[idx + 1])
+        idx += 2
+
+        # value might appear after ALL rows, so we allow scanning forward:
+        # take the next float as line_total
+        while idx < len(stream) and not isinstance(stream[idx], float):
+            idx += 1
+        if idx >= len(stream):
+            break
+        line_total = float(stream[idx])
+        idx += 1
+
         desc = normalize_desc_for_storage(raw_desc.replace("manopera", "").strip())
 
         warnings: List[str] = []
@@ -403,6 +418,7 @@ def parse_labor_table_zip(section_lines: List[str], default_currency: str) -> Li
             "confidence_fields": {"qty": 0.9, "unit": 0.9, "unit_price": 0.9, "line_total": 0.9},
             "warnings": warnings,
         })
+
     return items
 
 def parse_model2_zip(all_lines: List[str], default_currency: str) -> List[Dict[str, Any]]:
