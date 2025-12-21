@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel, Field
 
-# --- BigQuery imports (safe) ---
+# --- NEW: BigQuery imports (safe) ---
 try:
     from google.cloud import bigquery
     from google.oauth2 import service_account
@@ -877,7 +877,7 @@ def _download_file(url: str) -> bytes:
 
 
 # =========================
-# BigQuery price lookup
+# NEW: BigQuery price lookup (UPDATED for Airtable + Make)
 # =========================
 
 class PriceLookupRequest(BaseModel):
@@ -885,25 +885,31 @@ class PriceLookupRequest(BaseModel):
     brand: Optional[str] = None
     min_price: float = 0.0
     token_limit: int = 6  # max tokens we enforce in LIKE
-    unit_price: Optional[float] = None  # daca vrei ratio/verdict vs pretul din deviz
-    debug: bool = False  # daca e true, returnam SQL si identity
+
+    # optional: daca vrei verdict/ratio direct din API
+    unit_price: Optional[float] = None
+
+    # optional: noise filter on/off
+    noise_filter: bool = True
+
+    # optional: daca vrei debug complet
+    debug: bool = False
+
 
 class PriceLookupResponse(BaseModel):
     source_count: int = 0
-
-    # NOTE: ca sa nu moara mapping-ul in Make/Airtable pe null, le tinem float (default 0)
-    price_min: float = 0.0
-    price_median: float = 0.0
-    price_max: float = 0.0
-    price_p90: float = 0.0
+    price_min: Optional[float] = None
+    price_median: Optional[float] = None
+    price_max: Optional[float] = None
+    price_p90: Optional[float] = None
 
     tokens_used: List[str] = Field(default_factory=list)
-    tokens_used_text: str = ""  # ex: "filtru, ulei"
 
-    # pentru Airtable / Make
-    market_confidence: float = 0.0  # 0..1
-    market_verdict: str = ""        # "ok" / "overpriced" / "no_data" / "low_confidence"
-    market_ratio_to_p90: float = 0.0
+    # Airtable-friendly fields
+    tokens_used_str: str = ""
+    market_confidence: str = "LOW"      # must match Airtable single select: LOW/MED/HIGH
+    market_verdict: str = "NO_DATA"     # string simplu
+    market_ratio_to_p90: Optional[float] = None
 
     debug: Dict[str, Any] = Field(default_factory=dict)
 
@@ -915,6 +921,7 @@ _FEED_STOPWORDS = {
     "manopera", "operatie", "revizie", "generala"
 }
 
+# filtre simple pt anunturi "zgomotoase"
 _NOISE_REGEX = r"\b(compatibil|potrivit|se potriveste|nu include|fara|universal|set complet|cadou)\b"
 
 def _normalize_for_search(s: str) -> str:
@@ -971,29 +978,25 @@ def _bq_table_fqn() -> str:
         raise HTTPException(status_code=500, detail="Server missing BQ_PROJECT/BQ_DATASET/BQ_TABLE")
     return f"`{project}.{dataset}.{table}`"
 
-def _confidence_from_count(source_count: int) -> float:
-    # 0..1, praguri simple (ca sa nu fie mega-opinie)
-    if source_count <= 0:
-        return 0.0
-    if source_count >= 200:
-        return 1.0
-    if source_count >= 50:
-        return 0.85
-    if source_count >= 20:
-        return 0.65
-    if source_count >= 10:
-        return 0.45
-    if source_count >= 5:
-        return 0.30
-    return 0.15
+def _confidence_from_count(n: int) -> str:
+    # praguri simple, stabile, usor de inteles
+    if n >= 500:
+        return "HIGH"
+    if n >= 100:
+        return "MED"
+    return "LOW"
 
-def _safe_float0(x: Any) -> float:
-    try:
-        if x is None:
-            return 0.0
-        return float(x)
-    except Exception:
-        return 0.0
+def _verdict_from_ratio(r: Optional[float]) -> str:
+    if r is None:
+        return "NO_DATA"
+    # 1.0 = unit_price egal cu p90 (scump, dar in zona "upper market")
+    if r <= 0.80:
+        return "CHEAP"
+    if r <= 1.20:
+        return "OK"
+    if r <= 1.60:
+        return "HIGH"
+    return "VERY_HIGH"
 
 @app.post("/price_lookup", response_model=PriceLookupResponse)
 def price_lookup(payload: PriceLookupRequest):
@@ -1002,10 +1005,9 @@ def price_lookup(payload: PriceLookupRequest):
         return PriceLookupResponse(
             source_count=0,
             tokens_used=[],
-            tokens_used_text="",
-            market_confidence=0.0,
-            market_verdict="no_data",
-            market_ratio_to_p90=0.0,
+            tokens_used_str="",
+            market_confidence="LOW",
+            market_verdict="NO_DATA",
             debug={"reason": "empty_desc"} if payload.debug else {}
         )
 
@@ -1014,36 +1016,36 @@ def price_lookup(payload: PriceLookupRequest):
         return PriceLookupResponse(
             source_count=0,
             tokens_used=[],
-            tokens_used_text="",
-            market_confidence=0.0,
-            market_verdict="no_data",
-            market_ratio_to_p90=0.0,
+            tokens_used_str="",
+            market_confidence="LOW",
+            market_verdict="NO_DATA",
             debug={"reason": "no_tokens"} if payload.debug else {}
         )
 
     brand = _normalize_for_search(payload.brand or "")
     min_price = float(payload.min_price or 0.0)
-    unit_price = float(payload.unit_price) if payload.unit_price is not None else None
+    unit_price = _safe_float(payload.unit_price)
+    noise_filter = bool(payload.noise_filter)
 
     table_fqn = _bq_table_fqn()
 
-    # cautam in title + description (ca sa nu pierdem produse unde title e scurt)
-    searchable = "LOWER(CONCAT(IFNULL(title,''), ' ', IFNULL(description,'')))"
+    # Search text: title + description (ca sa prinzi cazuri unde title e scurt)
+    search_expr = "LOWER(CONCAT(IFNULL(title,''), ' ', IFNULL(description,'')))"
 
     where_clauses = ["price > @min_price"]
     params = [bigquery.ScalarQueryParameter("min_price", "FLOAT64", min_price)]
 
     for i, tok in enumerate(tokens):
         pname = f"t{i}"
-        where_clauses.append(f"{searchable} LIKE CONCAT('%', @{pname}, '%')")
+        where_clauses.append(f"{search_expr} LIKE CONCAT('%', @{pname}, '%')")
         params.append(bigquery.ScalarQueryParameter(pname, "STRING", tok))
 
     if brand:
         where_clauses.append("LOWER(brand) LIKE CONCAT('%', @brand, '%')")
         params.append(bigquery.ScalarQueryParameter("brand", "STRING", brand))
 
-    # filtru de “zgomot” (optional, dar l-am lasat ON by default)
-    where_clauses.append(f"NOT REGEXP_CONTAINS({searchable}, r'{_NOISE_REGEX}')")
+    if noise_filter:
+        where_clauses.append(f"NOT REGEXP_CONTAINS({search_expr}, r'{_NOISE_REGEX}')")
 
     sql = f"""
     SELECT
@@ -1059,62 +1061,38 @@ def price_lookup(payload: PriceLookupRequest):
     client = _get_bq_client()
     job_config = bigquery.QueryJobConfig(query_parameters=params)
 
-    # daca ai BQ_LOCATION in env (ex: europe-west3), o folosim
-    location = (os.getenv("BQ_LOCATION") or "").strip() or None
-
     try:
-        job = client.query(sql, job_config=job_config, location=location)
-        rows = list(job.result())
+        rows = list(client.query(sql, job_config=job_config).result())
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"BigQuery query failed: {e}")
 
     if not rows:
-        # Make/Airtable safe defaults (0), dar pastram debug daca e cerut
-        dbg = {}
-        if payload.debug:
-            dbg = {"table_fqn": table_fqn, "sql": sql, "tokens_used": tokens, "brand_filter": brand or None, "min_price": min_price, "location": location}
+        conf = _confidence_from_count(0)
         return PriceLookupResponse(
             source_count=0,
-            price_min=0.0,
-            price_median=0.0,
-            price_max=0.0,
-            price_p90=0.0,
             tokens_used=tokens,
-            tokens_used_text=", ".join(tokens),
-            market_confidence=0.0,
-            market_verdict="no_data",
-            market_ratio_to_p90=0.0,
-            debug=dbg
+            tokens_used_str=" ".join(tokens),
+            market_confidence=conf,
+            market_verdict="NO_DATA",
+            debug={"table_fqn": table_fqn, "sql": sql, "tokens_used": tokens} if payload.debug else {}
         )
 
     r0 = rows[0]
     source_count = int(r0.get("source_count") or 0)
+    price_min = float(r0.get("price_min")) if r0.get("price_min") is not None else None
+    price_median = float(r0.get("price_median")) if r0.get("price_median") is not None else None
+    price_max = float(r0.get("price_max")) if r0.get("price_max") is not None else None
+    price_p90 = float(r0.get("price_p90")) if r0.get("price_p90") is not None else None
 
-    price_min = _safe_float0(r0.get("price_min"))
-    price_median = _safe_float0(r0.get("price_median"))
-    price_max = _safe_float0(r0.get("price_max"))
-    price_p90 = _safe_float0(r0.get("price_p90"))
+    conf = _confidence_from_count(source_count)
 
-    confidence = _confidence_from_count(source_count)
+    ratio = None
+    verdict = "NO_DATA"
+    if unit_price is not None and price_p90 is not None and price_p90 > 0:
+        ratio = round(float(unit_price) / float(price_p90), 4)
+        verdict = _verdict_from_ratio(ratio)
 
-    ratio_to_p90 = 0.0
-    verdict = "no_data"
-
-    if source_count <= 0 or price_p90 <= 0:
-        verdict = "no_data"
-        confidence = 0.0
-    else:
-        if unit_price is None or unit_price <= 0:
-            verdict = "ok" if confidence >= 0.45 else "low_confidence"
-            ratio_to_p90 = 0.0
-        else:
-            ratio_to_p90 = unit_price / price_p90 if price_p90 > 0 else 0.0
-            if confidence < 0.45:
-                verdict = "low_confidence"
-            else:
-                verdict = "ok" if unit_price <= price_p90 else "overpriced"
-
-    dbg: Dict[str, Any] = {}
+    dbg = {}
     if payload.debug:
         dbg = {
             "table_fqn": table_fqn,
@@ -1122,18 +1100,10 @@ def price_lookup(payload: PriceLookupRequest):
             "tokens_used": tokens,
             "brand_filter": brand or None,
             "min_price": min_price,
-            "noise_filter": True,
-            "location": location,
+            "noise_filter": noise_filter,
             "identity": {
                 "bq_client_project": getattr(client, "project", None),
-                "bq_location_env": location,
-            },
-            "calc": {
-                "unit_price": unit_price,
-                "price_p90": price_p90,
-                "ratio_to_p90": ratio_to_p90,
-                "confidence": confidence,
-                "verdict": verdict,
+                "bq_location_env": os.getenv("BQ_LOCATION"),
             }
         }
 
@@ -1144,10 +1114,10 @@ def price_lookup(payload: PriceLookupRequest):
         price_max=price_max,
         price_p90=price_p90,
         tokens_used=tokens,
-        tokens_used_text=", ".join(tokens),
-        market_confidence=float(confidence),
-        market_verdict=str(verdict),
-        market_ratio_to_p90=float(ratio_to_p90),
+        tokens_used_str=" ".join(tokens),
+        market_confidence=conf,      # LOW/MED/HIGH => perfect pt Airtable Single select
+        market_verdict=verdict,
+        market_ratio_to_p90=ratio,
         debug=dbg
     )
 
