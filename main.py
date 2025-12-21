@@ -2,7 +2,6 @@ import os
 import re
 import json
 import base64
-import math
 import requests
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -41,7 +40,9 @@ class ExtractedItem(BaseModel):
     line_total: float = 0.0
     currency: str = "RON"
     warnings: List[str] = Field(default_factory=list)
-    code: str = ""  # part code (string gol daca nu e gasit / nu e valid)
+
+    # part code (string gol daca nu e gasit / nu e valid)
+    code: str = ""
 
 
 class Totals(BaseModel):
@@ -152,6 +153,7 @@ def _clean_code_candidate(s: str) -> str:
     return s
 
 def _is_row_index_code(s: str) -> bool:
+    # "1" "2" "3" "4" "5" "1." "01" "001" etc
     return bool(re.fullmatch(r"\d{1,3}\.?", s))
 
 def _is_valid_part_code(code: str) -> bool:
@@ -170,11 +172,11 @@ def _is_valid_part_code(code: str) -> bool:
     if len(c) >= 4 and re.search(r"[A-Za-z]", c) and re.search(r"\d", c):
         return True
 
-    # accept coduri cu separatori
+    # accept coduri cu separatori, destul de lungi: 62-7304-46037, 5NU0R4JHI, etc
     if len(c) >= 6 and re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z\.\-_/]+", c) and re.search(r"[.\-_/]", c):
         return True
 
-    # accept numeric cu punct (ex: 365.372)
+    # accept numeric cu punct (ex: 365.372) ca posibil cod de piesa/serie
     if re.fullmatch(r"\d{2,6}(\.\d{2,6}){1,3}", c):
         return True
 
@@ -184,6 +186,7 @@ def _extract_code_from_text(raw_line: str, desc: str) -> Tuple[str, str]:
     """
     Intoarce (code, desc_without_code_if_removed).
     Codul e extras conservator, doar daca e valid.
+    Daca nu, code = "" si desc ramane neschimbat.
     """
     candidates: List[str] = []
 
@@ -299,7 +302,7 @@ def reconstruct_lines_from_words(words: List[_Word]) -> List[str]:
 
 
 # =========================
-# Parser A (generic lines)
+# Parser A (generic lines) - good for Deviz 1/2
 # =========================
 
 def _split_tail_numbers(line: str) -> Tuple[str, List[float]]:
@@ -379,7 +382,7 @@ def parse_generic_lines(lines: List[str], currency: str = "RON") -> List[Extract
 
 
 # =========================
-# Parser B (table aware)
+# Parser B (table aware) - for Deviz 3 / AutoDeviz style
 # =========================
 
 def _detect_autodeviz_table(lines: List[str]) -> bool:
@@ -518,6 +521,7 @@ def _parse_autodeviz_rows(words: List[_Word], currency: str = "RON") -> List[Ext
                 mat_tokens = rest[i_lval + 1: qty_pos2]
                 mat_desc = _norm_spaces(" ".join(mat_tokens)).strip(' "')
 
+        # labor item
         labor_unit_price = 0.0
         labor_warnings: List[str] = []
         if time_h > 0 and labor_val > 0:
@@ -538,6 +542,7 @@ def _parse_autodeviz_rows(words: List[_Word], currency: str = "RON") -> List[Ext
             code=""
         ))
 
+        # material item
         if mat_desc and qty is not None and unit_price is not None and material_val is not None:
             part_warnings: List[str] = []
             if abs((qty * unit_price) - material_val) > 2.0:
@@ -879,28 +884,26 @@ class PriceLookupRequest(BaseModel):
     desc: str
     brand: Optional[str] = None
     min_price: float = 0.0
-    token_limit: int = 6
-
-    # NEW (optional) - nu strica ce merge
-    debug: Optional[bool] = False
-    include_description: Optional[bool] = True  # cauta in title + description
-    noise_filter: Optional[bool] = True         # scoate "compatibil/potrivit..." etc
-    p90_quantile: Optional[int] = 90            # default 90
-
+    token_limit: int = 6  # max tokens we enforce in LIKE
+    unit_price: Optional[float] = None  # daca vrei ratio/verdict vs pretul din deviz
+    debug: bool = False  # daca e true, returnam SQL si identity
 
 class PriceLookupResponse(BaseModel):
     source_count: int = 0
-    price_min: Optional[float] = None
-    price_median: Optional[float] = None
-    price_max: Optional[float] = None
 
-    # NEW - ca sa ai camp direct de mapat in Make/Airtable
-    price_p90: Optional[float] = None
-    market_verdict: str = ""
-    market_confidence: float = 0.0
-    market_ratio_to_p90: Optional[float] = None
+    # NOTE: ca sa nu moara mapping-ul in Make/Airtable pe null, le tinem float (default 0)
+    price_min: float = 0.0
+    price_median: float = 0.0
+    price_max: float = 0.0
+    price_p90: float = 0.0
+
     tokens_used: List[str] = Field(default_factory=list)
-    tokens_used_str: str = ""  # "filtru ulei"
+    tokens_used_text: str = ""  # ex: "filtru, ulei"
+
+    # pentru Airtable / Make
+    market_confidence: float = 0.0  # 0..1
+    market_verdict: str = ""        # "ok" / "overpriced" / "no_data" / "low_confidence"
+    market_ratio_to_p90: float = 0.0
 
     debug: Dict[str, Any] = Field(default_factory=dict)
 
@@ -914,13 +917,11 @@ _FEED_STOPWORDS = {
 
 _NOISE_REGEX = r"\b(compatibil|potrivit|se potriveste|nu include|fara|universal|set complet|cadou)\b"
 
-
 def _normalize_for_search(s: str) -> str:
     s = (s or "").lower().strip()
     s = re.sub(r"[^a-z0-9\.\-_/ ]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
-
 
 def _extract_search_tokens(desc: str, limit: int = 6) -> List[str]:
     s = _normalize_for_search(desc)
@@ -942,7 +943,6 @@ def _extract_search_tokens(desc: str, limit: int = 6) -> List[str]:
     tokens = sorted(list(dict.fromkeys(tokens)), key=lambda x: (-len(x), x))
     return tokens[: max(1, min(limit, len(tokens)))]
 
-
 def _get_bq_client() -> "bigquery.Client":
     if bigquery is None or service_account is None:
         raise HTTPException(status_code=500, detail="BigQuery deps missing. Add google-cloud-bigquery to requirements.")
@@ -963,7 +963,6 @@ def _get_bq_client() -> "bigquery.Client":
 
     return bigquery.Client(project=project, credentials=creds)
 
-
 def _bq_table_fqn() -> str:
     project = os.getenv("BQ_PROJECT", "").strip()
     dataset = os.getenv("BQ_DATASET", "").strip()
@@ -972,38 +971,42 @@ def _bq_table_fqn() -> str:
         raise HTTPException(status_code=500, detail="Server missing BQ_PROJECT/BQ_DATASET/BQ_TABLE")
     return f"`{project}.{dataset}.{table}`"
 
-
-def _compute_verdict(source_count: int) -> str:
-    if source_count <= 0:
-        return "no_match"
-    if source_count < 20:
-        return "low_data"
-    if source_count < 200:
-        return "ok"
-    return "strong"
-
-
-def _compute_confidence(source_count: int) -> float:
-    # 0..1 (log scale). 1 la ~10k+
+def _confidence_from_count(source_count: int) -> float:
+    # 0..1, praguri simple (ca sa nu fie mega-opinie)
     if source_count <= 0:
         return 0.0
-    v = math.log10(source_count + 1.0) / 4.0
-    return float(max(0.0, min(1.0, v)))
+    if source_count >= 200:
+        return 1.0
+    if source_count >= 50:
+        return 0.85
+    if source_count >= 20:
+        return 0.65
+    if source_count >= 10:
+        return 0.45
+    if source_count >= 5:
+        return 0.30
+    return 0.15
 
+def _safe_float0(x: Any) -> float:
+    try:
+        if x is None:
+            return 0.0
+        return float(x)
+    except Exception:
+        return 0.0
 
 @app.post("/price_lookup", response_model=PriceLookupResponse)
 def price_lookup(payload: PriceLookupRequest):
     desc = _norm_spaces(payload.desc or "")
-    want_debug = bool(payload.debug)
-
     if not desc:
         return PriceLookupResponse(
             source_count=0,
             tokens_used=[],
-            tokens_used_str="",
-            market_verdict="empty_desc",
+            tokens_used_text="",
             market_confidence=0.0,
-            debug={"reason": "empty_desc"} if want_debug else {}
+            market_verdict="no_data",
+            market_ratio_to_p90=0.0,
+            debug={"reason": "empty_desc"} if payload.debug else {}
         )
 
     tokens = _extract_search_tokens(desc, limit=int(payload.token_limit or 6))
@@ -1011,54 +1014,44 @@ def price_lookup(payload: PriceLookupRequest):
         return PriceLookupResponse(
             source_count=0,
             tokens_used=[],
-            tokens_used_str="",
-            market_verdict="no_tokens",
+            tokens_used_text="",
             market_confidence=0.0,
-            debug={"reason": "no_tokens"} if want_debug else {}
+            market_verdict="no_data",
+            market_ratio_to_p90=0.0,
+            debug={"reason": "no_tokens"} if payload.debug else {}
         )
 
     brand = _normalize_for_search(payload.brand or "")
     min_price = float(payload.min_price or 0.0)
-    include_desc = True if payload.include_description is None else bool(payload.include_description)
-    noise_filter = True if payload.noise_filter is None else bool(payload.noise_filter)
-
-    q90 = int(payload.p90_quantile or 90)
-    if q90 < 1:
-        q90 = 1
-    if q90 > 99:
-        q90 = 99
+    unit_price = float(payload.unit_price) if payload.unit_price is not None else None
 
     table_fqn = _bq_table_fqn()
 
-    # text field: title only vs title+description
-    if include_desc:
-        text_expr = "LOWER(CONCAT(IFNULL(title,''), ' ', IFNULL(description,'')))"
-    else:
-        text_expr = "LOWER(IFNULL(title,''))"
+    # cautam in title + description (ca sa nu pierdem produse unde title e scurt)
+    searchable = "LOWER(CONCAT(IFNULL(title,''), ' ', IFNULL(description,'')))"
 
     where_clauses = ["price > @min_price"]
     params = [bigquery.ScalarQueryParameter("min_price", "FLOAT64", min_price)]
 
     for i, tok in enumerate(tokens):
         pname = f"t{i}"
-        where_clauses.append(f"{text_expr} LIKE CONCAT('%', @{pname}, '%')")
+        where_clauses.append(f"{searchable} LIKE CONCAT('%', @{pname}, '%')")
         params.append(bigquery.ScalarQueryParameter(pname, "STRING", tok))
 
     if brand:
-        where_clauses.append("LOWER(IFNULL(brand,'')) LIKE CONCAT('%', @brand, '%')")
+        where_clauses.append("LOWER(brand) LIKE CONCAT('%', @brand, '%')")
         params.append(bigquery.ScalarQueryParameter("brand", "STRING", brand))
 
-    if noise_filter:
-        where_clauses.append(f"NOT REGEXP_CONTAINS({text_expr}, r'{_NOISE_REGEX}')")
+    # filtru de “zgomot” (optional, dar l-am lasat ON by default)
+    where_clauses.append(f"NOT REGEXP_CONTAINS({searchable}, r'{_NOISE_REGEX}')")
 
-    # NOTE: folosim APPROX_QUANTILES(price, 100)[OFFSET(q90)] ca P90-ish (q90 1..99)
     sql = f"""
     SELECT
       COUNT(*) AS source_count,
       ROUND(MIN(price), 2) AS price_min,
       ROUND(APPROX_QUANTILES(price, 2)[OFFSET(1)], 2) AS price_median,
       ROUND(MAX(price), 2) AS price_max,
-      ROUND(APPROX_QUANTILES(price, 100)[OFFSET({q90})], 2) AS price_p90
+      ROUND(APPROX_QUANTILES(price, 100)[OFFSET(90)], 2) AS price_p90
     FROM {table_fqn}
     WHERE {" AND ".join(where_clauses)}
     """
@@ -1066,73 +1059,95 @@ def price_lookup(payload: PriceLookupRequest):
     client = _get_bq_client()
     job_config = bigquery.QueryJobConfig(query_parameters=params)
 
+    # daca ai BQ_LOCATION in env (ex: europe-west3), o folosim
+    location = (os.getenv("BQ_LOCATION") or "").strip() or None
+
     try:
-        job = client.query(sql, job_config=job_config)
+        job = client.query(sql, job_config=job_config, location=location)
         rows = list(job.result())
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"BigQuery query failed: {e}")
 
     if not rows:
-        sc = 0
-        verdict = _compute_verdict(sc)
-        conf = _compute_confidence(sc)
+        # Make/Airtable safe defaults (0), dar pastram debug daca e cerut
+        dbg = {}
+        if payload.debug:
+            dbg = {"table_fqn": table_fqn, "sql": sql, "tokens_used": tokens, "brand_filter": brand or None, "min_price": min_price, "location": location}
         return PriceLookupResponse(
             source_count=0,
-            price_min=None,
-            price_median=None,
-            price_max=None,
-            price_p90=None,
+            price_min=0.0,
+            price_median=0.0,
+            price_max=0.0,
+            price_p90=0.0,
             tokens_used=tokens,
-            tokens_used_str=" ".join(tokens),
-            market_verdict=verdict,
-            market_confidence=conf,
-            market_ratio_to_p90=None,
-            debug={"table_fqn": table_fqn, "sql": sql} if want_debug else {}
+            tokens_used_text=", ".join(tokens),
+            market_confidence=0.0,
+            market_verdict="no_data",
+            market_ratio_to_p90=0.0,
+            debug=dbg
         )
 
     r0 = rows[0]
-    sc = int(r0.get("source_count") or 0)
+    source_count = int(r0.get("source_count") or 0)
 
-    pmin = float(r0.get("price_min")) if r0.get("price_min") is not None else None
-    pmed = float(r0.get("price_median")) if r0.get("price_median") is not None else None
-    pmax = float(r0.get("price_max")) if r0.get("price_max") is not None else None
-    pp90 = float(r0.get("price_p90")) if r0.get("price_p90") is not None else None
+    price_min = _safe_float0(r0.get("price_min"))
+    price_median = _safe_float0(r0.get("price_median"))
+    price_max = _safe_float0(r0.get("price_max"))
+    price_p90 = _safe_float0(r0.get("price_p90"))
 
-    verdict = _compute_verdict(sc)
-    conf = _compute_confidence(sc)
+    confidence = _confidence_from_count(source_count)
 
-    ratio = None
-    if pmed is not None and pp90 is not None and pp90 > 0:
-        ratio = float(round(pmed / pp90, 4))
+    ratio_to_p90 = 0.0
+    verdict = "no_data"
 
-    dbg = {}
-    if want_debug:
+    if source_count <= 0 or price_p90 <= 0:
+        verdict = "no_data"
+        confidence = 0.0
+    else:
+        if unit_price is None or unit_price <= 0:
+            verdict = "ok" if confidence >= 0.45 else "low_confidence"
+            ratio_to_p90 = 0.0
+        else:
+            ratio_to_p90 = unit_price / price_p90 if price_p90 > 0 else 0.0
+            if confidence < 0.45:
+                verdict = "low_confidence"
+            else:
+                verdict = "ok" if unit_price <= price_p90 else "overpriced"
+
+    dbg: Dict[str, Any] = {}
+    if payload.debug:
         dbg = {
             "table_fqn": table_fqn,
             "sql": sql,
             "tokens_used": tokens,
             "brand_filter": brand or None,
             "min_price": min_price,
-            "include_description": include_desc,
-            "noise_filter": noise_filter,
-            "p90_quantile": q90,
+            "noise_filter": True,
+            "location": location,
             "identity": {
                 "bq_client_project": getattr(client, "project", None),
-                "bq_location_env": os.getenv("BQ_LOCATION"),
+                "bq_location_env": location,
+            },
+            "calc": {
+                "unit_price": unit_price,
+                "price_p90": price_p90,
+                "ratio_to_p90": ratio_to_p90,
+                "confidence": confidence,
+                "verdict": verdict,
             }
         }
 
     return PriceLookupResponse(
-        source_count=sc,
-        price_min=pmin,
-        price_median=pmed,
-        price_max=pmax,
-        price_p90=pp90,
+        source_count=source_count,
+        price_min=price_min,
+        price_median=price_median,
+        price_max=price_max,
+        price_p90=price_p90,
         tokens_used=tokens,
-        tokens_used_str=" ".join(tokens),
-        market_verdict=verdict,
-        market_confidence=conf,
-        market_ratio_to_p90=ratio,
+        tokens_used_text=", ".join(tokens),
+        market_confidence=float(confidence),
+        market_verdict=str(verdict),
+        market_ratio_to_p90=float(ratio_to_p90),
         debug=dbg
     )
 
@@ -1144,15 +1159,6 @@ def price_lookup(payload: PriceLookupRequest):
 @app.get("/health")
 def health():
     return {"ok": True}
-
-# optional (nu strica nimic) - ca sa nu mai vezi 404 pe /meta.json
-@app.get("/meta.json")
-def meta():
-    return {
-        "name": app.title,
-        "version": app.version,
-        "endpoints": ["/health", "/process_deviz_url", "/process_deviz_file", "/price_lookup"],
-    }
 
 
 @app.post("/process_deviz_url", response_model=DevizResponse)
