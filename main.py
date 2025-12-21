@@ -3,7 +3,6 @@ import re
 import json
 import base64
 import requests
-import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -18,19 +17,9 @@ except Exception:
     service_account = None
 
 
-# =========================
-# Logging
-# =========================
-logger = logging.getLogger("deviz_api")
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(levelname)s: %(message)s",
-)
-
-
 app = FastAPI(
     title="Deviz Parser Hybrid: Vision Layout Primary + GPT Fallback",
-    version="0.2.1"  # bumped for debug build
+    version="0.2.0"
 )
 
 # =========================
@@ -158,14 +147,17 @@ STOP_CODES = {
     "materiale", "manopera", "operatie", "cod", "nr", "nr."
 }
 
+
 def _clean_code_candidate(s: str) -> str:
     s = (s or "").strip().strip('"').strip()
     s = re.sub(r"\s+", "", s)  # codurile de obicei n-au spatii
     return s
 
+
 def _is_row_index_code(s: str) -> bool:
     # "1" "2" "3" "4" "5" "1." "01" "001" etc
     return bool(re.fullmatch(r"\d{1,3}\.?", s))
+
 
 def _is_valid_part_code(code: str) -> bool:
     c = _clean_code_candidate(code)
@@ -192,6 +184,7 @@ def _is_valid_part_code(code: str) -> bool:
         return True
 
     return False
+
 
 def _extract_code_from_text(raw_line: str, desc: str) -> Tuple[str, str]:
     """
@@ -888,15 +881,23 @@ def _download_file(url: str) -> bytes:
 
 
 # =========================
-# NEW: BigQuery price lookup + Debug
+# BigQuery price lookup (B: search title + description always)
 # =========================
 
 class PriceLookupRequest(BaseModel):
     desc: str
     brand: Optional[str] = None
     min_price: float = 0.0
-    token_limit: int = 6  # max tokens we enforce in LIKE
-    debug: bool = False   # if true, returns full debug in response
+    token_limit: int = 6
+
+    # debug payload (optional)
+    debug: bool = False
+
+    # always search title+description
+    use_description: bool = True
+
+    # remove obvious marketing / compat noise
+    noise_filter: bool = True
 
 
 class PriceLookupResponse(BaseModel):
@@ -912,8 +913,12 @@ _FEED_STOPWORDS = {
     "si", "sau", "cu", "din", "de", "la", "pe", "ptr", "pentru",
     "set", "kit", "buc", "buc.", "uc", "um", "u.m", "um.", "pcs",
     "lei", "ron", "tva", "total", "pret", "valoare", "cantitate",
-    "manopera", "operatie", "revizie", "generala"
+    "manopera", "operatie", "revizie", "generala",
+
+    # extra noise words
+    "compatibil", "potrivit", "include", "fara", "nu"
 }
+
 
 def _normalize_for_search(s: str) -> str:
     s = (s or "").lower().strip()
@@ -921,10 +926,12 @@ def _normalize_for_search(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
+
 def _extract_search_tokens(desc: str, limit: int = 6) -> List[str]:
     s = _normalize_for_search(desc)
     if not s:
         return []
+
     raw_tokens = s.split()
 
     tokens: List[str] = []
@@ -933,15 +940,18 @@ def _extract_search_tokens(desc: str, limit: int = 6) -> List[str]:
             continue
         if len(t) <= 2:
             continue
+        # exclude pure numbers that are too short (like 1 2 3)
         if re.fullmatch(r"\d{1,2}", t):
             continue
         tokens.append(t)
 
-    # prefer longer tokens first (reduces wild matches)
+    # prefer longer tokens first (reduces wild matches like "ulei")
     tokens = sorted(list(dict.fromkeys(tokens)), key=lambda x: (-len(x), x))
+
     return tokens[: max(1, min(limit, len(tokens)))]
 
-def _get_bq_client_and_identity() -> Tuple["bigquery.Client", Dict[str, Any]]:
+
+def _get_bq_client() -> "bigquery.Client":
     if bigquery is None or service_account is None:
         raise HTTPException(status_code=500, detail="BigQuery deps missing. Add google-cloud-bigquery to requirements.")
 
@@ -955,19 +965,13 @@ def _get_bq_client_and_identity() -> Tuple["bigquery.Client", Dict[str, Any]]:
         raise HTTPException(status_code=500, detail=f"Invalid GOOGLE_APPLICATION_CREDENTIALS_JSON: {e}")
 
     creds = service_account.Credentials.from_service_account_info(info)
-    bq_project = os.getenv("BQ_PROJECT", "").strip() or info.get("project_id") or ""
-    if not bq_project:
+
+    project = os.getenv("BQ_PROJECT", "").strip() or info.get("project_id") or ""
+    if not project:
         raise HTTPException(status_code=500, detail="Server missing BQ_PROJECT (and no project_id in credentials)")
 
-    client = bigquery.Client(project=bq_project, credentials=creds)
+    return bigquery.Client(project=project, credentials=creds)
 
-    ident = {
-        "bq_client_project": client.project,
-        "sa_email": info.get("client_email"),
-        "cred_project_id": info.get("project_id"),
-        "bq_location_env": os.getenv("BQ_LOCATION", "").strip() or None,
-    }
-    return client, ident
 
 def _bq_table_fqn() -> str:
     project = os.getenv("BQ_PROJECT", "").strip()
@@ -977,136 +981,95 @@ def _bq_table_fqn() -> str:
         raise HTTPException(status_code=500, detail="Server missing BQ_PROJECT/BQ_DATASET/BQ_TABLE")
     return f"`{project}.{dataset}.{table}`"
 
-def _should_debug(flag_from_payload: bool) -> bool:
-    if flag_from_payload:
-        return True
-    return os.getenv("DEBUG_PRICE_LOOKUP", "0").strip() in ("1", "true", "True", "YES", "yes")
-
-def _mask(s: Optional[str], keep: int = 4) -> Optional[str]:
-    if not s:
-        return None
-    s = str(s)
-    if len(s) <= keep:
-        return "*" * len(s)
-    return s[:keep] + ("*" * (len(s) - keep))
-
-def _meta_public() -> Dict[str, Any]:
-    return {
-        "service": app.title,
-        "version": app.version,
-        "has_bigquery_lib": bigquery is not None,
-        "env": {
-            "BQ_PROJECT": os.getenv("BQ_PROJECT", "").strip() or None,
-            "BQ_DATASET": os.getenv("BQ_DATASET", "").strip() or None,
-            "BQ_TABLE": os.getenv("BQ_TABLE", "").strip() or None,
-            "BQ_LOCATION": os.getenv("BQ_LOCATION", "").strip() or None,
-            "DEBUG_PRICE_LOOKUP": os.getenv("DEBUG_PRICE_LOOKUP", "0").strip(),
-            "LOG_LEVEL": os.getenv("LOG_LEVEL", "INFO").strip(),
-            "has_GOOGLE_APPLICATION_CREDENTIALS_JSON": bool(os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()),
-            "has_GOOGLE_VISION_API_KEY": bool(os.getenv("GOOGLE_VISION_API_KEY", "").strip()),
-            "has_OPENAI_API_KEY": bool(os.getenv("OPENAI_API_KEY", "").strip()),
-            "OPENAI_MODEL": os.getenv("OPENAI_MODEL", "").strip() or None,
-        }
-    }
-
-@app.get("/meta.json")
-def meta():
-    # nu expune secrete, doar ce ajuta la debugging
-    return _meta_public()
 
 @app.post("/price_lookup", response_model=PriceLookupResponse)
 def price_lookup(payload: PriceLookupRequest):
     desc = _norm_spaces(payload.desc or "")
-    debug_on = _should_debug(bool(payload.debug))
-
     if not desc:
-        return PriceLookupResponse(
-            source_count=0,
-            tokens_used=[],
-            debug={"reason": "empty_desc"} if debug_on else {}
-        )
+        return PriceLookupResponse(source_count=0, tokens_used=[], debug={"reason": "empty_desc"} if payload.debug else {})
 
     tokens = _extract_search_tokens(desc, limit=int(payload.token_limit or 6))
     if not tokens:
-        return PriceLookupResponse(
-            source_count=0,
-            tokens_used=[],
-            debug={"reason": "no_tokens", "normalized_desc": _normalize_for_search(desc)} if debug_on else {}
-        )
+        return PriceLookupResponse(source_count=0, tokens_used=[], debug={"reason": "no_tokens"} if payload.debug else {})
 
     brand = _normalize_for_search(payload.brand or "")
     min_price = float(payload.min_price or 0.0)
 
     table_fqn = _bq_table_fqn()
 
-    # Build WHERE: enforce ALL tokens
+    # B: search title + description always (safe)
+    text_expr = "LOWER(CONCAT(IFNULL(title,''), ' ', IFNULL(description,'')))"
+
     where_clauses = ["price > @min_price"]
     params = [
         bigquery.ScalarQueryParameter("min_price", "FLOAT64", min_price),
     ]
 
+    # enforce ALL tokens
     for i, tok in enumerate(tokens):
         pname = f"t{i}"
-        where_clauses.append(f"LOWER(title) LIKE CONCAT('%', @{pname}, '%')")
+        where_clauses.append(f"{text_expr} LIKE CONCAT('%', @{pname}, '%')")
         params.append(bigquery.ScalarQueryParameter(pname, "STRING", tok))
 
     if brand:
-        # NOTE: this assumes you have a column named 'brand' in the table
         where_clauses.append("LOWER(brand) LIKE CONCAT('%', @brand, '%')")
         params.append(bigquery.ScalarQueryParameter("brand", "STRING", brand))
+
+    # anti-noise filter (optional but recommended)
+    if payload.noise_filter:
+        where_clauses.append(
+            f"NOT REGEXP_CONTAINS({text_expr}, r'\\b(compatibil|potrivit|se potriveste|nu include|fara|universal|set complet|cadou)\\b')"
+        )
 
     sql = f"""
     SELECT
       COUNT(*) AS source_count,
       ROUND(MIN(price), 2) AS price_min,
       ROUND(APPROX_QUANTILES(price, 2)[OFFSET(1)], 2) AS price_median,
-      ROUND(MAX(price), 2) AS price_max
+      ROUND(MAX(price), 2) AS price_max,
+      ROUND(APPROX_QUANTILES(price, 100)[OFFSET(90)], 2) AS price_p90
     FROM {table_fqn}
     WHERE {" AND ".join(where_clauses)}
     """
 
-    client, ident = _get_bq_client_and_identity()
-
+    client = _get_bq_client()
     job_config = bigquery.QueryJobConfig(query_parameters=params)
 
-    # Optional job location (important if dataset is in EU region etc)
-    location = os.getenv("BQ_LOCATION", "").strip() or None
+    try:
+        rows = list(client.query(sql, job_config=job_config).result())
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"BigQuery query failed: {e}")
+
+    if not rows:
+        dbg = {"table_fqn": table_fqn, "sql": sql, "tokens_used": tokens} if payload.debug else {}
+        return PriceLookupResponse(source_count=0, tokens_used=tokens, debug=dbg)
+
+    r0 = rows[0]
 
     dbg: Dict[str, Any] = {}
-    if debug_on:
+    if payload.debug:
         dbg = {
             "table_fqn": table_fqn,
             "sql": sql,
             "tokens_used": tokens,
             "brand_filter": brand or None,
             "min_price": min_price,
-            "location": location,
-            "identity": ident,
+            "noise_filter": payload.noise_filter,
+            "price_p90": float(r0.get("price_p90")) if r0.get("price_p90") is not None else None,
+            "identity": {
+                "bq_client_project": getattr(client, "project", None),
+                "bq_location_env": os.getenv("BQ_LOCATION"),
+            }
         }
 
-    try:
-        job = client.query(sql, job_config=job_config, location=location)
-        rows = list(job.result())
-    except Exception as e:
-        if debug_on:
-            dbg["error"] = str(e)
-            logger.exception("BigQuery query failed")
-            raise HTTPException(status_code=502, detail={"error": f"BigQuery query failed: {e}", "debug": dbg})
-        raise HTTPException(status_code=502, detail=f"BigQuery query failed: {e}")
-
-    if not rows:
-        return PriceLookupResponse(source_count=0, tokens_used=tokens, debug=dbg if debug_on else {})
-
-    r0 = rows[0]
-    resp = PriceLookupResponse(
+    return PriceLookupResponse(
         source_count=int(r0.get("source_count") or 0),
         price_min=float(r0.get("price_min")) if r0.get("price_min") is not None else None,
         price_median=float(r0.get("price_median")) if r0.get("price_median") is not None else None,
         price_max=float(r0.get("price_max")) if r0.get("price_max") is not None else None,
         tokens_used=tokens,
-        debug=dbg if debug_on else {}
+        debug=dbg
     )
-    return resp
 
 
 # =========================
