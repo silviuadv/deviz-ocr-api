@@ -8,6 +8,15 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel, Field
 
+# --- NEW: BigQuery imports (safe) ---
+try:
+    from google.cloud import bigquery
+    from google.oauth2 import service_account
+except Exception:
+    bigquery = None
+    service_account = None
+
+
 app = FastAPI(
     title="Deviz Parser Hybrid: Vision Layout Primary + GPT Fallback",
     version="0.2.0"
@@ -32,7 +41,7 @@ class ExtractedItem(BaseModel):
     currency: str = "RON"
     warnings: List[str] = Field(default_factory=list)
 
-    # NEW: part code (string gol daca nu e gasit / nu e valid)
+    # part code (string gol daca nu e gasit / nu e valid)
     code: str = ""
 
 
@@ -179,30 +188,24 @@ def _extract_code_from_text(raw_line: str, desc: str) -> Tuple[str, str]:
     Codul e extras conservator, doar daca e valid.
     Daca nu, code = "" si desc ramane neschimbat.
     """
-    # cautam in inceputul liniei / descrierii
     candidates: List[str] = []
 
     for src in [raw_line or "", desc or ""]:
         s = _norm_spaces(src)
         if not s:
             continue
-        # ia primele 3 token-uri; de obicei codul e primul
         toks = s.split()
         for t in toks[:3]:
             candidates.append(t)
 
-    # mai cauta pattern explicit "ID:xxxxx"
     m = re.search(r"\bID[:\s]*([0-9A-Za-z\.\-_/]+)\b", raw_line or "", flags=re.IGNORECASE)
     if m:
         candidates.insert(0, m.group(1))
 
-    # incearca prima potrivire valida
     for cand in candidates:
         c = _clean_code_candidate(cand)
         if _is_valid_part_code(c):
-            # daca e chiar la inceputul desc, il scoatem din desc ca sa ramana curat
             desc2 = desc or ""
-            # scoate doar daca apare exact ca prim token
             if desc2.strip().startswith(cand.strip()):
                 desc2 = _norm_spaces(desc2.strip()[len(cand.strip()):]).lstrip(" -:/")
             return c, desc2
@@ -357,7 +360,6 @@ def parse_generic_lines(lines: List[str], currency: str = "RON") -> List[Extract
         if not desc:
             continue
 
-        # NEW: extract code safely (only for part items)
         code = ""
         desc2 = desc
         if kind == "part":
@@ -537,7 +539,7 @@ def _parse_autodeviz_rows(words: List[_Word], currency: str = "RON") -> List[Ext
             line_total=float(labor_val or 0.0),
             currency=currency,
             warnings=labor_warnings,
-            code=""  # labor code: lasam gol
+            code=""
         ))
 
         # material item
@@ -546,7 +548,6 @@ def _parse_autodeviz_rows(words: List[_Word], currency: str = "RON") -> List[Ext
             if abs((qty * unit_price) - material_val) > 2.0:
                 part_warnings.append("derived_unit_price_or_total_mismatch")
 
-            # NEW: extract code from mat_desc/text (safe)
             code, mat_desc2 = _extract_code_from_text(raw_line=text, desc=mat_desc)
 
             items.append(ExtractedItem(
@@ -731,13 +732,11 @@ def _openai_fallback(image_bytes: bytes, raw_text: str) -> DevizResponse:
 
     parsed = json.loads(out_text)
 
-    # normalize + ALSO apply conservative code validator (ca sa nu bage 1..5)
     items: List[ExtractedItem] = []
     for it in (parsed.get("items") or []):
         try:
             obj = ExtractedItem(**it)
             if obj.kind == "part":
-                # validate code strictly
                 obj.code = _clean_code_candidate(obj.code)
                 if not _is_valid_part_code(obj.code):
                     obj.code = ""
@@ -875,6 +874,155 @@ def _download_file(url: str) -> bytes:
     if r.status_code != 200:
         raise HTTPException(status_code=502, detail=f"Failed to download file: {r.status_code}")
     return r.content
+
+
+# =========================
+# NEW: BigQuery price lookup
+# =========================
+
+class PriceLookupRequest(BaseModel):
+    desc: str
+    brand: Optional[str] = None
+    min_price: float = 0.0
+    token_limit: int = 6  # max tokens we enforce in LIKE
+
+
+class PriceLookupResponse(BaseModel):
+    source_count: int = 0
+    price_min: Optional[float] = None
+    price_median: Optional[float] = None
+    price_max: Optional[float] = None
+    tokens_used: List[str] = Field(default_factory=list)
+    debug: Dict[str, Any] = Field(default_factory=dict)
+
+
+_FEED_STOPWORDS = {
+    "si", "sau", "cu", "din", "de", "la", "pe", "ptr", "pentru",
+    "set", "kit", "buc", "buc.", "uc", "um", "u.m", "um.", "pcs",
+    "lei", "ron", "tva", "total", "pret", "valoare", "cantitate",
+    "manopera", "operatie", "revizie", "generala"
+}
+
+def _normalize_for_search(s: str) -> str:
+    s = (s or "").lower().strip()
+    s = re.sub(r"[^a-z0-9\.\-_/ ]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _extract_search_tokens(desc: str, limit: int = 6) -> List[str]:
+    s = _normalize_for_search(desc)
+    if not s:
+        return []
+
+    raw_tokens = s.split()
+
+    tokens: List[str] = []
+    for t in raw_tokens:
+        if t in _FEED_STOPWORDS:
+            continue
+        if len(t) <= 2:
+            continue
+        # exclude pure numbers that are too short (like 1 2 3)
+        if re.fullmatch(r"\d{1,2}", t):
+            continue
+        tokens.append(t)
+
+    # prefer longer tokens first (reduces wild matches like "ulei")
+    tokens = sorted(list(dict.fromkeys(tokens)), key=lambda x: (-len(x), x))
+
+    return tokens[: max(1, min(limit, len(tokens)))]
+
+def _get_bq_client() -> "bigquery.Client":
+    if bigquery is None or service_account is None:
+        raise HTTPException(status_code=500, detail="BigQuery deps missing. Add google-cloud-bigquery to requirements.")
+
+    cred_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()
+    if not cred_json:
+        raise HTTPException(status_code=500, detail="Server missing GOOGLE_APPLICATION_CREDENTIALS_JSON")
+
+    try:
+        info = json.loads(cred_json)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Invalid GOOGLE_APPLICATION_CREDENTIALS_JSON: {e}")
+
+    creds = service_account.Credentials.from_service_account_info(info)
+    project = os.getenv("BQ_PROJECT", "").strip() or info.get("project_id") or ""
+    if not project:
+        raise HTTPException(status_code=500, detail="Server missing BQ_PROJECT (and no project_id in credentials)")
+
+    return bigquery.Client(project=project, credentials=creds)
+
+def _bq_table_fqn() -> str:
+    project = os.getenv("BQ_PROJECT", "").strip()
+    dataset = os.getenv("BQ_DATASET", "").strip()
+    table = os.getenv("BQ_TABLE", "").strip()
+    if not project or not dataset or not table:
+        raise HTTPException(status_code=500, detail="Server missing BQ_PROJECT/BQ_DATASET/BQ_TABLE")
+    return f"`{project}.{dataset}.{table}`"
+
+@app.post("/price_lookup", response_model=PriceLookupResponse)
+def price_lookup(payload: PriceLookupRequest):
+    desc = _norm_spaces(payload.desc or "")
+    if not desc:
+        return PriceLookupResponse(source_count=0, tokens_used=[], debug={"reason": "empty_desc"})
+
+    tokens = _extract_search_tokens(desc, limit=int(payload.token_limit or 6))
+    if not tokens:
+        return PriceLookupResponse(source_count=0, tokens_used=[], debug={"reason": "no_tokens"})
+
+    brand = _normalize_for_search(payload.brand or "")
+    min_price = float(payload.min_price or 0.0)
+
+    table_fqn = _bq_table_fqn()
+
+    # Build WHERE: enforce ALL tokens
+    where_clauses = ["price > @min_price"]
+    params = [
+        bigquery.ScalarQueryParameter("min_price", "FLOAT64", min_price),
+    ]
+
+    for i, tok in enumerate(tokens):
+        pname = f"t{i}"
+        where_clauses.append(f"LOWER(title) LIKE CONCAT('%', @{pname}, '%')")
+        params.append(bigquery.ScalarQueryParameter(pname, "STRING", tok))
+
+    if brand:
+        where_clauses.append("LOWER(brand) LIKE CONCAT('%', @brand, '%')")
+        params.append(bigquery.ScalarQueryParameter("brand", "STRING", brand))
+
+    sql = f"""
+    SELECT
+      COUNT(*) AS source_count,
+      ROUND(MIN(price), 2) AS price_min,
+      ROUND(APPROX_QUANTILES(price, 2)[OFFSET(1)], 2) AS price_median,
+      ROUND(MAX(price), 2) AS price_max
+    FROM {table_fqn}
+    WHERE {" AND ".join(where_clauses)}
+    """
+
+    client = _get_bq_client()
+    job_config = bigquery.QueryJobConfig(query_parameters=params)
+
+    try:
+        rows = list(client.query(sql, job_config=job_config).result())
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"BigQuery query failed: {e}")
+
+    if not rows:
+        return PriceLookupResponse(source_count=0, tokens_used=tokens, debug={"sql": sql})
+
+    r0 = rows[0]
+    return PriceLookupResponse(
+        source_count=int(r0.get("source_count") or 0),
+        price_min=float(r0.get("price_min")) if r0.get("price_min") is not None else None,
+        price_median=float(r0.get("price_median")) if r0.get("price_median") is not None else None,
+        price_max=float(r0.get("price_max")) if r0.get("price_max") is not None else None,
+        tokens_used=tokens,
+        debug={
+            "brand_filter": brand or None,
+            "min_price": min_price,
+        }
+    )
 
 
 # =========================
