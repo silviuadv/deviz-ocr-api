@@ -10,10 +10,10 @@ from pydantic import BaseModel, Field
 
 # --- NEW: BigQuery imports (safe) ---
 try:
-    from google.cloud import bigquery as gcp_bigquery
+    from google.cloud import bigquery
     from google.oauth2 import service_account
 except Exception:
-    gcp_bigquery = None
+    bigquery = None
     service_account = None
 
 
@@ -877,7 +877,7 @@ def _download_file(url: str) -> bytes:
 
 
 # =========================
-# NEW: BigQuery price lookup
+# NEW: BigQuery price lookup (SAFE)
 # =========================
 
 class PriceLookupRequest(BaseModel):
@@ -915,26 +915,28 @@ def _extract_search_tokens(desc: str, limit: int = 6) -> List[str]:
         return []
 
     raw_tokens = s.split()
-
     tokens: List[str] = []
     for t in raw_tokens:
         if t in _FEED_STOPWORDS:
             continue
         if len(t) <= 2:
             continue
-        # exclude pure numbers that are too short (like 1 2 3)
         if re.fullmatch(r"\d{1,2}", t):
             continue
         tokens.append(t)
 
-    # prefer longer tokens first (reduces wild matches like "ulei")
     tokens = sorted(list(dict.fromkeys(tokens)), key=lambda x: (-len(x), x))
-
     return tokens[: max(1, min(limit, len(tokens)))]
 
-def _get_bq_client() -> "gcp_bigquery.Client":
-    if gcp_bigquery is None or service_account is None:
-        raise HTTPException(status_code=500, detail="BigQuery deps missing. Add google-cloud-bigquery to requirements.")
+def _bq_assert_available():
+    if bigquery is None or service_account is None:
+        raise HTTPException(
+            status_code=500,
+            detail="BigQuery deps missing (import failed). Ensure requirements include: google-cloud-bigquery google-auth"
+        )
+
+def _get_bq_client() -> "bigquery.Client":
+    _bq_assert_available()
 
     cred_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()
     if not cred_json:
@@ -946,11 +948,11 @@ def _get_bq_client() -> "gcp_bigquery.Client":
         raise HTTPException(status_code=500, detail=f"Invalid GOOGLE_APPLICATION_CREDENTIALS_JSON: {e}")
 
     creds = service_account.Credentials.from_service_account_info(info)
-    project = os.getenv("BQ_PROJECT", "").strip() or info.get("project_id") or ""
+    project = (os.getenv("BQ_PROJECT", "").strip() or info.get("project_id") or "").strip()
     if not project:
         raise HTTPException(status_code=500, detail="Server missing BQ_PROJECT (and no project_id in credentials)")
 
-    return gcp_bigquery.Client(project=project, credentials=creds)
+    return bigquery.Client(project=project, credentials=creds)
 
 def _bq_table_fqn() -> str:
     project = os.getenv("BQ_PROJECT", "").strip()
@@ -962,6 +964,8 @@ def _bq_table_fqn() -> str:
 
 @app.post("/price_lookup", response_model=PriceLookupResponse)
 def price_lookup(payload: PriceLookupRequest):
+    _bq_assert_available()
+
     desc = _norm_spaces(payload.desc or "")
     if not desc:
         return PriceLookupResponse(source_count=0, tokens_used=[], debug={"reason": "empty_desc"})
@@ -975,20 +979,17 @@ def price_lookup(payload: PriceLookupRequest):
 
     table_fqn = _bq_table_fqn()
 
-    # Build WHERE: enforce ALL tokens
     where_clauses = ["price > @min_price"]
-    params = [
-        gcp_bigquery.ScalarQueryParameter("min_price", "FLOAT64", min_price),
-    ]
+    params = [bigquery.ScalarQueryParameter("min_price", "FLOAT64", min_price)]
 
     for i, tok in enumerate(tokens):
         pname = f"t{i}"
         where_clauses.append(f"LOWER(title) LIKE CONCAT('%', @{pname}, '%')")
-        params.append(gcp_bigquery.ScalarQueryParameter(pname, "STRING", tok))
+        params.append(bigquery.ScalarQueryParameter(pname, "STRING", tok))
 
     if brand:
         where_clauses.append("LOWER(brand) LIKE CONCAT('%', @brand, '%')")
-        params.append(gcp_bigquery.ScalarQueryParameter("brand", "STRING", brand))
+        params.append(bigquery.ScalarQueryParameter("brand", "STRING", brand))
 
     sql = f"""
     SELECT
@@ -1004,24 +1005,31 @@ def price_lookup(payload: PriceLookupRequest):
     job_config = bigquery.QueryJobConfig(query_parameters=params)
 
     try:
-    job = client.query(
-        sql,
-        job_config=job_config,
-        project=os.getenv("BQ_PROJECT")
-    )
-    rows = list(job.result())
+        # IMPORTANT: force the job project explicitly
+        job = client.query(
+            sql,
+            job_config=job_config,
+            project=os.getenv("BQ_PROJECT") or client.project
+        )
+        rows = list(job.result())
     except Exception as e:
-    raise HTTPException(status_code=502, detail=f"BigQuery query failed: {e}")
+        raise HTTPException(status_code=502, detail=f"BigQuery query failed: {e}")
 
     if not rows:
         return PriceLookupResponse(source_count=0, tokens_used=tokens, debug={"sql": sql})
 
     r0 = rows[0]
+    # Row is a bigquery.table.Row; use dict-style access
+    sc = r0["source_count"] if "source_count" in r0 else 0
+    pmin = r0["price_min"] if "price_min" in r0 else None
+    pmed = r0["price_median"] if "price_median" in r0 else None
+    pmax = r0["price_max"] if "price_max" in r0 else None
+
     return PriceLookupResponse(
-        source_count=int(r0.get("source_count") or 0),
-        price_min=float(r0.get("price_min")) if r0.get("price_min") is not None else None,
-        price_median=float(r0.get("price_median")) if r0.get("price_median") is not None else None,
-        price_max=float(r0.get("price_max")) if r0.get("price_max") is not None else None,
+        source_count=int(sc or 0),
+        price_min=float(pmin) if pmin is not None else None,
+        price_median=float(pmed) if pmed is not None else None,
+        price_max=float(pmax) if pmax is not None else None,
         tokens_used=tokens,
         debug={
             "brand_filter": brand or None,
