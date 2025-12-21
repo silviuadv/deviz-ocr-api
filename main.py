@@ -10,10 +10,10 @@ from pydantic import BaseModel, Field
 
 # --- NEW: BigQuery imports (safe) ---
 try:
-    from google.cloud import bigquery
+    from google.cloud import bigquery as gcp_bigquery
     from google.oauth2 import service_account
 except Exception:
-    bigquery = None
+    gcp_bigquery = None
     service_account = None
 
 
@@ -932,8 +932,8 @@ def _extract_search_tokens(desc: str, limit: int = 6) -> List[str]:
 
     return tokens[: max(1, min(limit, len(tokens)))]
 
-def _get_bq_client() -> "bigquery.Client":
-    if bigquery is None or service_account is None:
+def _get_bq_client() -> "gcp_bigquery.Client":
+    if gcp_bigquery is None or service_account is None:
         raise HTTPException(status_code=500, detail="BigQuery deps missing. Add google-cloud-bigquery to requirements.")
 
     cred_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()
@@ -950,7 +950,7 @@ def _get_bq_client() -> "bigquery.Client":
     if not project:
         raise HTTPException(status_code=500, detail="Server missing BQ_PROJECT (and no project_id in credentials)")
 
-    return bigquery.Client(project=project, credentials=creds)
+    return gcp_bigquery.Client(project=project, credentials=creds)
 
 def _bq_table_fqn() -> str:
     project = os.getenv("BQ_PROJECT", "").strip()
@@ -978,17 +978,17 @@ def price_lookup(payload: PriceLookupRequest):
     # Build WHERE: enforce ALL tokens
     where_clauses = ["price > @min_price"]
     params = [
-        bigquery.ScalarQueryParameter("min_price", "FLOAT64", min_price),
+        gcp_bigquery.ScalarQueryParameter("min_price", "FLOAT64", min_price),
     ]
 
     for i, tok in enumerate(tokens):
         pname = f"t{i}"
         where_clauses.append(f"LOWER(title) LIKE CONCAT('%', @{pname}, '%')")
-        params.append(bigquery.ScalarQueryParameter(pname, "STRING", tok))
+        params.append(gcp_bigquery.ScalarQueryParameter(pname, "STRING", tok))
 
     if brand:
         where_clauses.append("LOWER(brand) LIKE CONCAT('%', @brand, '%')")
-        params.append(bigquery.ScalarQueryParameter("brand", "STRING", brand))
+        params.append(gcp_bigquery.ScalarQueryParameter("brand", "STRING", brand))
 
     sql = f"""
     SELECT
@@ -1001,7 +1001,7 @@ def price_lookup(payload: PriceLookupRequest):
     """
 
     client = _get_bq_client()
-    job_config = bigquery.QueryJobConfig(query_parameters=params)
+    job_config = gcp_bigquery.QueryJobConfig(query_parameters=params)
 
     try:
         rows = list(client.query(sql, job_config=job_config).result())
