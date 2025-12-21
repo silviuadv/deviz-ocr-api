@@ -3,12 +3,13 @@ import re
 import json
 import base64
 import requests
+import unicodedata
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel, Field
 
-# --- NEW: BigQuery imports (safe) ---
+# --- BigQuery imports (safe) ---
 try:
     from google.cloud import bigquery
     from google.oauth2 import service_account
@@ -877,22 +878,23 @@ def _download_file(url: str) -> bytes:
 
 
 # =========================
-# NEW: BigQuery price lookup (UPDATED for Airtable + Make)
+# NEW: BigQuery price lookup (improved)
 # =========================
 
 class PriceLookupRequest(BaseModel):
     desc: str
     brand: Optional[str] = None
     min_price: float = 0.0
-    token_limit: int = 6  # max tokens we enforce in LIKE
+    token_limit: int = 6
 
-    # optional: daca vrei verdict/ratio direct din API
+    # IMPORTANT: block labor lookups (your DB is parts-only)
+    kind: str = Field(default="part")  # "part" or "labor"
+
+    # optional: if you also send deviz unit_price, we compute ratio vs p90
     unit_price: Optional[float] = None
 
-    # optional: noise filter on/off
+    # filters/flags
     noise_filter: bool = True
-
-    # optional: daca vrei debug complet
     debug: bool = False
 
 
@@ -900,16 +902,15 @@ class PriceLookupResponse(BaseModel):
     source_count: int = 0
     price_min: Optional[float] = None
     price_median: Optional[float] = None
-    price_max: Optional[float] = None
     price_p90: Optional[float] = None
+    price_max: Optional[float] = None
 
     tokens_used: List[str] = Field(default_factory=list)
+    tokens_used_csv: str = ""
 
-    # Airtable-friendly fields
-    tokens_used_str: str = ""
-    market_confidence: str = "LOW"      # must match Airtable single select: LOW/MED/HIGH
-    market_verdict: str = "NO_DATA"     # string simplu
-    market_ratio_to_p90: Optional[float] = None
+    verdict: str = "NO_DATA"       # NO_DATA | OK | HIGH | LOW | WEAK_MATCH
+    confidence: str = "LOW"        # LOW | MED | HIGH
+    ratio_to_p90: Optional[float] = None
 
     debug: Dict[str, Any] = Field(default_factory=dict)
 
@@ -917,15 +918,22 @@ class PriceLookupResponse(BaseModel):
 _FEED_STOPWORDS = {
     "si", "sau", "cu", "din", "de", "la", "pe", "ptr", "pentru",
     "set", "kit", "buc", "buc.", "uc", "um", "u.m", "um.", "pcs",
-    "lei", "ron", "tva", "total", "pret", "valoare", "cantitate",
-    "manopera", "operatie", "revizie", "generala"
+    "lei", "ron", "tva", "subtotal", "total", "pret", "valoare", "cantitate",
+    "manopera", "operatie", "revizie", "generala",
+    "lucrare", "lucrari", "material", "materiale", "piese", "piesa",
 }
 
-# filtre simple pt anunturi "zgomotoase"
 _NOISE_REGEX = r"\b(compatibil|potrivit|se potriveste|nu include|fara|universal|set complet|cadou)\b"
+
+def _strip_diacritics(s: str) -> str:
+    s = s or ""
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return s
 
 def _normalize_for_search(s: str) -> str:
     s = (s or "").lower().strip()
+    s = _strip_diacritics(s)
     s = re.sub(r"[^a-z0-9\.\-_/ ]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
@@ -947,8 +955,11 @@ def _extract_search_tokens(desc: str, limit: int = 6) -> List[str]:
             continue
         tokens.append(t)
 
+    # prefer longer tokens first
     tokens = sorted(list(dict.fromkeys(tokens)), key=lambda x: (-len(x), x))
-    return tokens[: max(1, min(limit, len(tokens)))]
+
+    limit = max(1, min(int(limit or 6), 8))
+    return tokens[: min(limit, len(tokens))]
 
 def _get_bq_client() -> "bigquery.Client":
     if bigquery is None or service_account is None:
@@ -978,36 +989,68 @@ def _bq_table_fqn() -> str:
         raise HTTPException(status_code=500, detail="Server missing BQ_PROJECT/BQ_DATASET/BQ_TABLE")
     return f"`{project}.{dataset}.{table}`"
 
-def _confidence_from_count(n: int) -> str:
-    # praguri simple, stabile, usor de inteles
-    if n >= 500:
+def _compute_confidence(source_count: int, token_count: int, used_fallback_relax: bool) -> str:
+    if source_count <= 0:
+        return "LOW"
+    if used_fallback_relax:
+        # relax is inherently less "precise"
+        if source_count >= 200 and token_count >= 2:
+            return "MED"
+        return "LOW"
+    # strict
+    if source_count >= 200 and token_count >= 2:
         return "HIGH"
-    if n >= 100:
+    if source_count >= 50:
         return "MED"
     return "LOW"
 
-def _verdict_from_ratio(r: Optional[float]) -> str:
-    if r is None:
+def _compute_verdict(unit_price: Optional[float], p90: Optional[float], p50: Optional[float], source_count: int, confidence: str) -> str:
+    if source_count <= 0 or p50 is None:
         return "NO_DATA"
-    # 1.0 = unit_price egal cu p90 (scump, dar in zona "upper market")
-    if r <= 0.80:
-        return "CHEAP"
-    if r <= 1.20:
+    if confidence == "LOW" and source_count < 10:
+        return "WEAK_MATCH"
+
+    if unit_price is None or p90 is None:
         return "OK"
-    if r <= 1.60:
+
+    # simple, robust bands
+    if unit_price > (p90 * 1.20):
         return "HIGH"
-    return "VERY_HIGH"
+    if p50 and unit_price < (p50 * 0.60):
+        return "LOW"
+    return "OK"
+
+def _run_bq(sql: str, params: List["bigquery.ScalarQueryParameter"], client: "bigquery.Client") -> List[Any]:
+    job_config = bigquery.QueryJobConfig(query_parameters=params)
+    location = os.getenv("BQ_LOCATION", "").strip() or None
+    try:
+        job = client.query(sql, job_config=job_config, location=location)
+        return list(job.result())
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"BigQuery query failed: {e}")
 
 @app.post("/price_lookup", response_model=PriceLookupResponse)
 def price_lookup(payload: PriceLookupRequest):
+    # BLOCK labor lookups (parts-only DB)
+    kind = (payload.kind or "part").strip().lower()
+    if kind != "part":
+        return PriceLookupResponse(
+            source_count=0,
+            tokens_used=[],
+            tokens_used_csv="",
+            verdict="NO_DATA",
+            confidence="LOW",
+            debug={"reason": "kind_not_part"} if payload.debug else {}
+        )
+
     desc = _norm_spaces(payload.desc or "")
     if not desc:
         return PriceLookupResponse(
             source_count=0,
             tokens_used=[],
-            tokens_used_str="",
-            market_confidence="LOW",
-            market_verdict="NO_DATA",
+            tokens_used_csv="",
+            verdict="NO_DATA",
+            confidence="LOW",
             debug={"reason": "empty_desc"} if payload.debug else {}
         )
 
@@ -1016,28 +1059,32 @@ def price_lookup(payload: PriceLookupRequest):
         return PriceLookupResponse(
             source_count=0,
             tokens_used=[],
-            tokens_used_str="",
-            market_confidence="LOW",
-            market_verdict="NO_DATA",
+            tokens_used_csv="",
+            verdict="NO_DATA",
+            confidence="LOW",
             debug={"reason": "no_tokens"} if payload.debug else {}
         )
 
     brand = _normalize_for_search(payload.brand or "")
     min_price = float(payload.min_price or 0.0)
-    unit_price = _safe_float(payload.unit_price)
+    unit_price = float(payload.unit_price) if payload.unit_price is not None else None
     noise_filter = bool(payload.noise_filter)
 
     table_fqn = _bq_table_fqn()
+    client = _get_bq_client()
 
-    # Search text: title + description (ca sa prinzi cazuri unde title e scurt)
-    search_expr = "LOWER(CONCAT(IFNULL(title,''), ' ', IFNULL(description,'')))"
+    # search text = title + description (B)
+    text_expr = "LOWER(CONCAT(IFNULL(title,''), ' ', IFNULL(description,'')))"
 
+    # --------- PASS 1: STRICT (AND tokens) ----------
     where_clauses = ["price > @min_price"]
-    params = [bigquery.ScalarQueryParameter("min_price", "FLOAT64", min_price)]
+    params: List["bigquery.ScalarQueryParameter"] = [
+        bigquery.ScalarQueryParameter("min_price", "FLOAT64", min_price),
+    ]
 
     for i, tok in enumerate(tokens):
         pname = f"t{i}"
-        where_clauses.append(f"{search_expr} LIKE CONCAT('%', @{pname}, '%')")
+        where_clauses.append(f"{text_expr} LIKE CONCAT('%', @{pname}, '%')")
         params.append(bigquery.ScalarQueryParameter(pname, "STRING", tok))
 
     if brand:
@@ -1045,79 +1092,130 @@ def price_lookup(payload: PriceLookupRequest):
         params.append(bigquery.ScalarQueryParameter("brand", "STRING", brand))
 
     if noise_filter:
-        where_clauses.append(f"NOT REGEXP_CONTAINS({search_expr}, r'{_NOISE_REGEX}')")
+        where_clauses.append(f"NOT REGEXP_CONTAINS({text_expr}, r'{_NOISE_REGEX}')")
 
-    sql = f"""
+    sql_strict = f"""
     SELECT
       COUNT(*) AS source_count,
       ROUND(MIN(price), 2) AS price_min,
       ROUND(APPROX_QUANTILES(price, 2)[OFFSET(1)], 2) AS price_median,
-      ROUND(MAX(price), 2) AS price_max,
-      ROUND(APPROX_QUANTILES(price, 100)[OFFSET(90)], 2) AS price_p90
+      ROUND(APPROX_QUANTILES(price, 100)[OFFSET(90)], 2) AS price_p90,
+      ROUND(MAX(price), 2) AS price_max
     FROM {table_fqn}
     WHERE {" AND ".join(where_clauses)}
     """
 
-    client = _get_bq_client()
-    job_config = bigquery.QueryJobConfig(query_parameters=params)
+    rows = _run_bq(sql_strict, params, client)
+    r0 = rows[0] if rows else None
 
-    try:
-        rows = list(client.query(sql, job_config=job_config).result())
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"BigQuery query failed: {e}")
+    source_count = int((r0.get("source_count") if r0 else 0) or 0)
+    used_relax = False
 
-    if not rows:
-        conf = _confidence_from_count(0)
-        return PriceLookupResponse(
-            source_count=0,
-            tokens_used=tokens,
-            tokens_used_str=" ".join(tokens),
-            market_confidence=conf,
-            market_verdict="NO_DATA",
-            debug={"table_fqn": table_fqn, "sql": sql, "tokens_used": tokens} if payload.debug else {}
+    price_min = float(r0.get("price_min")) if r0 and r0.get("price_min") is not None else None
+    price_median = float(r0.get("price_median")) if r0 and r0.get("price_median") is not None else None
+    price_p90 = float(r0.get("price_p90")) if r0 and r0.get("price_p90") is not None else None
+    price_max = float(r0.get("price_max")) if r0 and r0.get("price_max") is not None else None
+
+    # --------- PASS 2: RELAX (score tokens) ----------
+    fallback_threshold = int(os.getenv("PRICE_LOOKUP_STRICT_MIN_SOURCES", "10").strip() or "10")
+    if source_count < fallback_threshold:
+        used_relax = True
+
+        # score = how many tokens match
+        # keep rows with matched_tokens >= required
+        token_count = len(tokens)
+        required = max(2, int((token_count * 0.6) + 0.9999))  # ceil(0.6 * token_count)
+
+        score_terms = []
+        where_any = []
+
+        # re-use min_price/brand/noise, but token matching becomes OR + score filter
+        where2 = ["price > @min_price"]
+        params2: List["bigquery.ScalarQueryParameter"] = [
+            bigquery.ScalarQueryParameter("min_price", "FLOAT64", min_price),
+            bigquery.ScalarQueryParameter("required", "INT64", required),
+        ]
+
+        for i, tok in enumerate(tokens):
+            pname = f"t{i}"
+            like_expr = f"{text_expr} LIKE CONCAT('%', @{pname}, '%')"
+            score_terms.append(f"CASE WHEN {like_expr} THEN 1 ELSE 0 END")
+            where_any.append(like_expr)
+            params2.append(bigquery.ScalarQueryParameter(pname, "STRING", tok))
+
+        if brand:
+            where2.append("LOWER(brand) LIKE CONCAT('%', @brand, '%')")
+            params2.append(bigquery.ScalarQueryParameter("brand", "STRING", brand))
+
+        if noise_filter:
+            where2.append(f"NOT REGEXP_CONTAINS({text_expr}, r'{_NOISE_REGEX}')")
+
+        # must match at least something, then apply required score
+        where2.append("(" + " OR ".join(where_any) + ")")
+
+        sql_relax = f"""
+        WITH scored AS (
+          SELECT
+            price,
+            ({' + '.join(score_terms)}) AS matched_tokens
+          FROM {table_fqn}
+          WHERE {" AND ".join(where2)}
         )
+        SELECT
+          COUNTIF(matched_tokens >= @required) AS source_count,
+          ROUND(MIN(IF(matched_tokens >= @required, price, NULL)), 2) AS price_min,
+          ROUND(APPROX_QUANTILES(IF(matched_tokens >= @required, price, NULL), 2)[OFFSET(1)], 2) AS price_median,
+          ROUND(APPROX_QUANTILES(IF(matched_tokens >= @required, price, NULL), 100)[OFFSET(90)], 2) AS price_p90,
+          ROUND(MAX(IF(matched_tokens >= @required, price, NULL)), 2) AS price_max
+        FROM scored
+        """
 
-    r0 = rows[0]
-    source_count = int(r0.get("source_count") or 0)
-    price_min = float(r0.get("price_min")) if r0.get("price_min") is not None else None
-    price_median = float(r0.get("price_median")) if r0.get("price_median") is not None else None
-    price_max = float(r0.get("price_max")) if r0.get("price_max") is not None else None
-    price_p90 = float(r0.get("price_p90")) if r0.get("price_p90") is not None else None
+        rows2 = _run_bq(sql_relax, params2, client)
+        r1 = rows2[0] if rows2 else None
 
-    conf = _confidence_from_count(source_count)
+        source_count = int((r1.get("source_count") if r1 else 0) or 0)
+        price_min = float(r1.get("price_min")) if r1 and r1.get("price_min") is not None else None
+        price_median = float(r1.get("price_median")) if r1 and r1.get("price_median") is not None else None
+        price_p90 = float(r1.get("price_p90")) if r1 and r1.get("price_p90") is not None else None
+        price_max = float(r1.get("price_max")) if r1 and r1.get("price_max") is not None else None
 
-    ratio = None
-    verdict = "NO_DATA"
+    confidence = _compute_confidence(source_count, len(tokens), used_relax)
+    verdict = _compute_verdict(unit_price, price_p90, price_median, source_count, confidence)
+
+    ratio_to_p90 = None
     if unit_price is not None and price_p90 is not None and price_p90 > 0:
-        ratio = round(float(unit_price) / float(price_p90), 4)
-        verdict = _verdict_from_ratio(ratio)
+        ratio_to_p90 = round(unit_price / price_p90, 4)
 
-    dbg = {}
+    tokens_used_csv = ", ".join(tokens)
+
+    dbg: Dict[str, Any] = {}
     if payload.debug:
         dbg = {
             "table_fqn": table_fqn,
-            "sql": sql,
             "tokens_used": tokens,
             "brand_filter": brand or None,
             "min_price": min_price,
             "noise_filter": noise_filter,
+            "mode": "relax" if used_relax else "strict",
+            "strict_min_sources_threshold": fallback_threshold,
             "identity": {
                 "bq_client_project": getattr(client, "project", None),
-                "bq_location_env": os.getenv("BQ_LOCATION"),
-            }
+                "bq_location_env": os.getenv("BQ_LOCATION", "").strip() or None,
+            },
+            "sql": (sql_relax if used_relax else sql_strict),
         }
 
     return PriceLookupResponse(
         source_count=source_count,
         price_min=price_min,
         price_median=price_median,
-        price_max=price_max,
         price_p90=price_p90,
+        price_max=price_max,
         tokens_used=tokens,
-        tokens_used_str=" ".join(tokens),
-        market_confidence=conf,      # LOW/MED/HIGH => perfect pt Airtable Single select
-        market_verdict=verdict,
-        market_ratio_to_p90=ratio,
+        tokens_used_csv=tokens_used_csv,
+        verdict=verdict,
+        confidence=confidence,
+        ratio_to_p90=ratio_to_p90,
         debug=dbg
     )
 
@@ -1130,12 +1228,10 @@ def price_lookup(payload: PriceLookupRequest):
 def health():
     return {"ok": True}
 
-
 @app.post("/process_deviz_url", response_model=DevizResponse)
 def process_deviz_url(payload: DevizUrlPayload):
     image_bytes = _download_file(payload.url)
     return _process_image(image_bytes)
-
 
 @app.post("/process_deviz_file", response_model=DevizResponse)
 async def process_deviz_file(file: UploadFile = File(...)):
