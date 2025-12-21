@@ -1001,12 +1001,17 @@ def price_lookup(payload: PriceLookupRequest):
     """
 
     client = _get_bq_client()
-    job_config = gcp_bigquery.QueryJobConfig(query_parameters=params)
+    job_config = bigquery.QueryJobConfig(query_parameters=params)
 
     try:
-        rows = list(client.query(sql, job_config=job_config).result())
+    job = client.query(
+        sql,
+        job_config=job_config,
+        project=os.getenv("BQ_PROJECT")
+    )
+    rows = list(job.result())
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"BigQuery query failed: {e}")
+    raise HTTPException(status_code=502, detail=f"BigQuery query failed: {e}")
 
     if not rows:
         return PriceLookupResponse(source_count=0, tokens_used=tokens, debug={"sql": sql})
