@@ -992,28 +992,48 @@ def _process_image(image_bytes: bytes) -> DevizResponse:
             "primary_used_parser": primary.debug.get("used_parser"),
         })
 
-        # ✅ UPDATE: INTERNAL CHECK (corect: trimiti payload)
-        internal = internal_deviz_check(
-        DevizInternalInput(
-        items=fb.items,
-        totals=fb.totals
-            )
+        # ✅ UPDATE: INTERNAL CHECK (corect: trimiti payload; + convertesti items/totals la modelul asteptat)
+        internal_payload = DevizInternalInput(
+            items=[
+                {
+                    "desc": it.desc,
+                    "kind": it.kind,
+                    "qty": float(it.qty or 0.0),
+                    "unit": it.unit or "",
+                    "unit_price": float(it.unit_price or 0.0),
+                    "line_total": float(it.line_total or 0.0),
+                    "currency": it.currency or "RON",
+                }
+                for it in (fb.items or [])
+            ],
+            totals=fb.totals.model_dump()
         )
-        fb.debug["internal_check"] = internal.model_dump()
+        internal = internal_deviz_check(internal_payload)
+        fb.debug["internal_check"] = _bm_to_dict(internal)
 
         return fb
 
     if not ok:
         primary.warnings = (primary.warnings or []) + ["primary_low_confidence: " + ",".join(reasons)]
 
-    # ✅ UPDATE: INTERNAL CHECK (corect: trimiti payload)
-    internal = internal_deviz_check(
-    DevizInternalInput(
-        items=primary.items,
-        totals=primary.totals
-        )
+    # ✅ UPDATE: INTERNAL CHECK (corect: trimiti payload; + convertesti items/totals la modelul asteptat)
+    internal_payload = DevizInternalInput(
+        items=[
+            {
+                "desc": it.desc,
+                "kind": it.kind,
+                "qty": float(it.qty or 0.0),
+                "unit": it.unit or "",
+                "unit_price": float(it.unit_price or 0.0),
+                "line_total": float(it.line_total or 0.0),
+                "currency": it.currency or "RON",
+            }
+            for it in (primary.items or [])
+        ],
+        totals=primary.totals.model_dump()
     )
-    primary.debug["internal_check"] = internal.model_dump()
+    internal = internal_deviz_check(internal_payload)
+    primary.debug["internal_check"] = _bm_to_dict(internal)
 
     return primary
 
