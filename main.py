@@ -3,7 +3,6 @@ import re
 import json
 import base64
 import requests
-import unicodedata
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -136,6 +135,32 @@ def _approx_equal(a: Optional[float], b: Optional[float], tol: float = 2.0) -> b
     if a is None or b is None:
         return False
     return abs(a - b) <= tol
+
+
+# =========================
+# NEW: Total/Subtotal guard + labor keyword guard (doar update-ul cerut)
+# =========================
+
+LABOR_KEYWORDS = [
+    "inlocuit", "schimb", "montaj", "demontare", "reparatie",
+    "verificare", "diagnoza", "curatare", "reglaj",
+    "revizie", "control", "testare", "service", "inspector",
+]
+
+def _is_totalish_line(s: str) -> bool:
+    # prinde: TOTAL, SUBTOTAL, TOTAL MATERIALE, TOTAL MANOPERA, etc
+    t = _norm_spaces(s).lower()
+    return bool(re.match(r"^(sub\s*total|subtotal|total)\b", t))
+
+def _looks_like_labor_desc(desc: str) -> bool:
+    d = _norm_spaces(desc).lower()
+    if not d:
+        return False
+    # daca incepe cu un verb/keyword de manopera
+    for kw in LABOR_KEYWORDS:
+        if d.startswith(kw + " ") or d == kw:
+            return True
+    return False
 
 
 # =========================
@@ -322,18 +347,31 @@ def parse_generic_lines(lines: List[str], currency: str = "RON") -> List[Extract
     items: List[ExtractedItem] = []
 
     noise = [
-        "pagina", "total deviz", "total materiale", "total manopera",
-        "lucrarile", "perioada", "certificat", "garantie"
+        "pagina", "lucrarile", "perioada", "certificat", "garantie",
+        # lasam totalurile sa fie prinse si de guard-ul explicit, dar nu strica daca apar aici
+        "total deviz", "total materiale", "total manopera", "subtotal"
     ]
 
     for line in lines:
         l = _norm_spaces(line)
         if len(l) < 4:
             continue
-        if _contains_any(l, noise):
+
+        # NEW: nu bagam TOTAL/SUBTOTAL ca item
+        if _is_totalish_line(l):
             continue
 
+        if _contains_any(l, noise):
+            # si aici pot cadea unele totaluri
+            if _is_totalish_line(l):
+                continue
+            # alte linii de zgomot
+            if _contains_any(l, ["pagina", "certificat", "garantie", "perioada"]):
+                continue
+
         desc, nums = _split_tail_numbers(l)
+
+        # daca nu are minim 2 numere, nu e linie de piesa/operatie cuantificata in formatul asta
         if len(nums) < 2:
             continue
 
@@ -349,16 +387,29 @@ def parse_generic_lines(lines: List[str], currency: str = "RON") -> List[Extract
                 if len(nums) == 2:
                     line_total = qty * unit_price
 
+        # --- kind detection (NU schimbam etichetele, doar clasificarea mai corecta) ---
         kind = "part"
         unit = ""
         dlow = desc.lower()
+
+        # daca apare explicit "manopera"
         if "manopera" in dlow:
             kind = "labor"
             unit = "ore"
             desc = re.sub(r"(?i)\bmanopera\b", "", desc).strip()
 
+        # NEW: daca descrierea arata ca actiune (inlocuit/schimb/montaj/etc) => labor
+        if kind == "part" and _looks_like_labor_desc(desc):
+            kind = "labor"
+            unit = "ore"
+
+        # strip leading item index like "1."
         desc = re.sub(r"^\d+\.?\s*", "", desc).strip()
         if not desc:
+            continue
+
+        # NEW: extra guard, dupa curatare
+        if _is_totalish_line(desc):
             continue
 
         code = ""
@@ -551,6 +602,10 @@ def _parse_autodeviz_rows(words: List[_Word], currency: str = "RON") -> List[Ext
 
             code, mat_desc2 = _extract_code_from_text(raw_line=text, desc=mat_desc)
 
+            # NEW: guard, daca a prins vreo linie totalish prin OCR (rar), o ignoram
+            if _is_totalish_line(mat_desc2):
+                continue
+
             items.append(ExtractedItem(
                 raw=text,
                 desc=mat_desc2,
@@ -683,6 +738,7 @@ def _openai_fallback(image_bytes: bytes, raw_text: str) -> DevizResponse:
         "- Daca un rand contine si operatie si material, creeaza 2 items: unul labor si unul part.\n"
         "- Pentru piese, daca exista un cod (alfanumeric sau numeric cu punct), pune-l in field 'code'.\n"
         "- Daca nu exista cod, pune code=\"\".\n"
+        "- NU include randuri de tip TOTAL/SUBTOTAL in items.\n"
     )
 
     req = {
@@ -737,12 +793,24 @@ def _openai_fallback(image_bytes: bytes, raw_text: str) -> DevizResponse:
     for it in (parsed.get("items") or []):
         try:
             obj = ExtractedItem(**it)
+
+            # NEW: scoatem TOTAL/SUBTOTAL daca au ajuns aici
+            if _is_totalish_line(obj.desc) or _is_totalish_line(obj.raw or ""):
+                continue
+
+            # NEW: daca a pus "part" dar descrierea arata clar a manopera -> corectam in labor
+            if obj.kind == "part" and _looks_like_labor_desc(obj.desc):
+                obj.kind = "labor"
+                obj.unit = "ore"
+                obj.code = ""
+
             if obj.kind == "part":
                 obj.code = _clean_code_candidate(obj.code)
                 if not _is_valid_part_code(obj.code):
                     obj.code = ""
             else:
                 obj.code = ""
+
             items.append(obj)
         except Exception:
             continue
@@ -808,6 +876,9 @@ def _build_response_from_primary(words: List[_Word], raw_text: str) -> DevizResp
     else:
         items = parse_generic_lines(lines, currency=currency)
         used_parser = "generic_lines"
+
+    # NEW: safety filter (daca o linie totalish a scapat)
+    items = [it for it in items if not _is_totalish_line(it.desc) and not _is_totalish_line(it.raw or "")]
 
     sum_guess = sum((it.line_total or 0.0) for it in items) if items else None
 
@@ -878,62 +949,38 @@ def _download_file(url: str) -> bytes:
 
 
 # =========================
-# NEW: BigQuery price lookup (improved)
+# BigQuery price lookup
 # =========================
 
 class PriceLookupRequest(BaseModel):
     desc: str
     brand: Optional[str] = None
     min_price: float = 0.0
-    token_limit: int = 6
-
-    # IMPORTANT: block labor lookups (your DB is parts-only)
-    kind: str = Field(default="part")  # "part" or "labor"
-
-    # optional: if you also send deviz unit_price, we compute ratio vs p90
-    unit_price: Optional[float] = None
-
-    # filters/flags
-    noise_filter: bool = True
-    debug: bool = False
+    token_limit: int = 6  # max tokens we enforce in LIKE
+    debug: Optional[bool] = False
 
 
 class PriceLookupResponse(BaseModel):
     source_count: int = 0
     price_min: Optional[float] = None
     price_median: Optional[float] = None
-    price_p90: Optional[float] = None
     price_max: Optional[float] = None
-
+    price_p90: Optional[float] = None
     tokens_used: List[str] = Field(default_factory=list)
-    tokens_used_csv: str = ""
-
-    verdict: str = "NO_DATA"       # NO_DATA | OK | HIGH | LOW | WEAK_MATCH
-    confidence: str = "LOW"        # LOW | MED | HIGH
-    ratio_to_p90: Optional[float] = None
-
     debug: Dict[str, Any] = Field(default_factory=dict)
 
 
 _FEED_STOPWORDS = {
     "si", "sau", "cu", "din", "de", "la", "pe", "ptr", "pentru",
     "set", "kit", "buc", "buc.", "uc", "um", "u.m", "um.", "pcs",
-    "lei", "ron", "tva", "subtotal", "total", "pret", "valoare", "cantitate",
-    "manopera", "operatie", "revizie", "generala",
-    "lucrare", "lucrari", "material", "materiale", "piese", "piesa",
+    "lei", "ron", "tva", "total", "pret", "valoare", "cantitate",
+    "manopera", "operatie", "revizie", "generala"
 }
 
 _NOISE_REGEX = r"\b(compatibil|potrivit|se potriveste|nu include|fara|universal|set complet|cadou)\b"
 
-def _strip_diacritics(s: str) -> str:
-    s = s or ""
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    return s
-
 def _normalize_for_search(s: str) -> str:
     s = (s or "").lower().strip()
-    s = _strip_diacritics(s)
     s = re.sub(r"[^a-z0-9\.\-_/ ]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
@@ -955,11 +1002,8 @@ def _extract_search_tokens(desc: str, limit: int = 6) -> List[str]:
             continue
         tokens.append(t)
 
-    # prefer longer tokens first
     tokens = sorted(list(dict.fromkeys(tokens)), key=lambda x: (-len(x), x))
-
-    limit = max(1, min(int(limit or 6), 8))
-    return tokens[: min(limit, len(tokens))]
+    return tokens[: max(1, min(limit, len(tokens)))]
 
 def _get_bq_client() -> "bigquery.Client":
     if bigquery is None or service_account is None:
@@ -989,235 +1033,89 @@ def _bq_table_fqn() -> str:
         raise HTTPException(status_code=500, detail="Server missing BQ_PROJECT/BQ_DATASET/BQ_TABLE")
     return f"`{project}.{dataset}.{table}`"
 
-def _compute_confidence(source_count: int, token_count: int, used_fallback_relax: bool) -> str:
-    if source_count <= 0:
-        return "LOW"
-    if used_fallback_relax:
-        # relax is inherently less "precise"
-        if source_count >= 200 and token_count >= 2:
-            return "MED"
-        return "LOW"
-    # strict
-    if source_count >= 200 and token_count >= 2:
-        return "HIGH"
-    if source_count >= 50:
-        return "MED"
-    return "LOW"
-
-def _compute_verdict(unit_price: Optional[float], p90: Optional[float], p50: Optional[float], source_count: int, confidence: str) -> str:
-    if source_count <= 0 or p50 is None:
-        return "NO_DATA"
-    if confidence == "LOW" and source_count < 10:
-        return "WEAK_MATCH"
-
-    if unit_price is None or p90 is None:
-        return "OK"
-
-    # simple, robust bands
-    if unit_price > (p90 * 1.20):
-        return "HIGH"
-    if p50 and unit_price < (p50 * 0.60):
-        return "LOW"
-    return "OK"
-
-def _run_bq(sql: str, params: List["bigquery.ScalarQueryParameter"], client: "bigquery.Client") -> List[Any]:
-    job_config = bigquery.QueryJobConfig(query_parameters=params)
-    location = os.getenv("BQ_LOCATION", "").strip() or None
-    try:
-        job = client.query(sql, job_config=job_config, location=location)
-        return list(job.result())
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"BigQuery query failed: {e}")
-
 @app.post("/price_lookup", response_model=PriceLookupResponse)
 def price_lookup(payload: PriceLookupRequest):
-    # BLOCK labor lookups (parts-only DB)
-    kind = (payload.kind or "part").strip().lower()
-    if kind != "part":
-        return PriceLookupResponse(
-            source_count=0,
-            tokens_used=[],
-            tokens_used_csv="",
-            verdict="NO_DATA",
-            confidence="LOW",
-            debug={"reason": "kind_not_part"} if payload.debug else {}
-        )
-
     desc = _norm_spaces(payload.desc or "")
     if not desc:
-        return PriceLookupResponse(
-            source_count=0,
-            tokens_used=[],
-            tokens_used_csv="",
-            verdict="NO_DATA",
-            confidence="LOW",
-            debug={"reason": "empty_desc"} if payload.debug else {}
-        )
+        return PriceLookupResponse(source_count=0, tokens_used=[], debug={"reason": "empty_desc"} if payload.debug else {})
 
     tokens = _extract_search_tokens(desc, limit=int(payload.token_limit or 6))
     if not tokens:
-        return PriceLookupResponse(
-            source_count=0,
-            tokens_used=[],
-            tokens_used_csv="",
-            verdict="NO_DATA",
-            confidence="LOW",
-            debug={"reason": "no_tokens"} if payload.debug else {}
-        )
+        return PriceLookupResponse(source_count=0, tokens_used=[], debug={"reason": "no_tokens"} if payload.debug else {})
 
     brand = _normalize_for_search(payload.brand or "")
     min_price = float(payload.min_price or 0.0)
-    unit_price = float(payload.unit_price) if payload.unit_price is not None else None
-    noise_filter = bool(payload.noise_filter)
 
     table_fqn = _bq_table_fqn()
-    client = _get_bq_client()
 
-    # search text = title + description (B)
-    text_expr = "LOWER(CONCAT(IFNULL(title,''), ' ', IFNULL(description,'')))"
+    # Search in title+description (B)
+    field_expr = "LOWER(CONCAT(IFNULL(title,''), ' ', IFNULL(description,'')))"
 
-    # --------- PASS 1: STRICT (AND tokens) ----------
     where_clauses = ["price > @min_price"]
-    params: List["bigquery.ScalarQueryParameter"] = [
-        bigquery.ScalarQueryParameter("min_price", "FLOAT64", min_price),
-    ]
+    params = [bigquery.ScalarQueryParameter("min_price", "FLOAT64", min_price)]
 
     for i, tok in enumerate(tokens):
         pname = f"t{i}"
-        where_clauses.append(f"{text_expr} LIKE CONCAT('%', @{pname}, '%')")
+        where_clauses.append(f"{field_expr} LIKE CONCAT('%', @{pname}, '%')")
         params.append(bigquery.ScalarQueryParameter(pname, "STRING", tok))
 
     if brand:
         where_clauses.append("LOWER(brand) LIKE CONCAT('%', @brand, '%')")
         params.append(bigquery.ScalarQueryParameter("brand", "STRING", brand))
 
-    if noise_filter:
-        where_clauses.append(f"NOT REGEXP_CONTAINS({text_expr}, r'{_NOISE_REGEX}')")
+    # noise filter on the same field
+    where_clauses.append(f"NOT REGEXP_CONTAINS({field_expr}, r'{_NOISE_REGEX}')")
 
-    sql_strict = f"""
+    sql = f"""
     SELECT
       COUNT(*) AS source_count,
       ROUND(MIN(price), 2) AS price_min,
       ROUND(APPROX_QUANTILES(price, 2)[OFFSET(1)], 2) AS price_median,
-      ROUND(APPROX_QUANTILES(price, 100)[OFFSET(90)], 2) AS price_p90,
-      ROUND(MAX(price), 2) AS price_max
+      ROUND(MAX(price), 2) AS price_max,
+      ROUND(APPROX_QUANTILES(price, 100)[OFFSET(90)], 2) AS price_p90
     FROM {table_fqn}
     WHERE {" AND ".join(where_clauses)}
     """
 
-    rows = _run_bq(sql_strict, params, client)
-    r0 = rows[0] if rows else None
+    client = _get_bq_client()
+    job_config = bigquery.QueryJobConfig(query_parameters=params)
 
-    source_count = int((r0.get("source_count") if r0 else 0) or 0)
-    used_relax = False
+    try:
+        rows = list(client.query(sql, job_config=job_config).result())
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"BigQuery query failed: {e}")
 
-    price_min = float(r0.get("price_min")) if r0 and r0.get("price_min") is not None else None
-    price_median = float(r0.get("price_median")) if r0 and r0.get("price_median") is not None else None
-    price_p90 = float(r0.get("price_p90")) if r0 and r0.get("price_p90") is not None else None
-    price_max = float(r0.get("price_max")) if r0 and r0.get("price_max") is not None else None
+    if not rows:
+        dbg = {"table_fqn": table_fqn, "sql": sql, "tokens_used": tokens, "brand_filter": brand or None, "min_price": min_price} if payload.debug else {}
+        return PriceLookupResponse(source_count=0, tokens_used=tokens, debug=dbg)
 
-    # --------- PASS 2: RELAX (score tokens) ----------
-    fallback_threshold = int(os.getenv("PRICE_LOOKUP_STRICT_MIN_SOURCES", "10").strip() or "10")
-    if source_count < fallback_threshold:
-        used_relax = True
+    r0 = rows[0]
+    resp = PriceLookupResponse(
+        source_count=int(r0.get("source_count") or 0),
+        price_min=float(r0.get("price_min")) if r0.get("price_min") is not None else None,
+        price_median=float(r0.get("price_median")) if r0.get("price_median") is not None else None,
+        price_max=float(r0.get("price_max")) if r0.get("price_max") is not None else None,
+        price_p90=float(r0.get("price_p90")) if r0.get("price_p90") is not None else None,
+        tokens_used=tokens,
+        debug={}
+    )
 
-        # score = how many tokens match
-        # keep rows with matched_tokens >= required
-        token_count = len(tokens)
-        required = max(2, int((token_count * 0.6) + 0.9999))  # ceil(0.6 * token_count)
-
-        score_terms = []
-        where_any = []
-
-        # re-use min_price/brand/noise, but token matching becomes OR + score filter
-        where2 = ["price > @min_price"]
-        params2: List["bigquery.ScalarQueryParameter"] = [
-            bigquery.ScalarQueryParameter("min_price", "FLOAT64", min_price),
-            bigquery.ScalarQueryParameter("required", "INT64", required),
-        ]
-
-        for i, tok in enumerate(tokens):
-            pname = f"t{i}"
-            like_expr = f"{text_expr} LIKE CONCAT('%', @{pname}, '%')"
-            score_terms.append(f"CASE WHEN {like_expr} THEN 1 ELSE 0 END")
-            where_any.append(like_expr)
-            params2.append(bigquery.ScalarQueryParameter(pname, "STRING", tok))
-
-        if brand:
-            where2.append("LOWER(brand) LIKE CONCAT('%', @brand, '%')")
-            params2.append(bigquery.ScalarQueryParameter("brand", "STRING", brand))
-
-        if noise_filter:
-            where2.append(f"NOT REGEXP_CONTAINS({text_expr}, r'{_NOISE_REGEX}')")
-
-        # must match at least something, then apply required score
-        where2.append("(" + " OR ".join(where_any) + ")")
-
-        sql_relax = f"""
-        WITH scored AS (
-          SELECT
-            price,
-            ({' + '.join(score_terms)}) AS matched_tokens
-          FROM {table_fqn}
-          WHERE {" AND ".join(where2)}
-        )
-        SELECT
-          COUNTIF(matched_tokens >= @required) AS source_count,
-          ROUND(MIN(IF(matched_tokens >= @required, price, NULL)), 2) AS price_min,
-          ROUND(APPROX_QUANTILES(IF(matched_tokens >= @required, price, NULL), 2)[OFFSET(1)], 2) AS price_median,
-          ROUND(APPROX_QUANTILES(IF(matched_tokens >= @required, price, NULL), 100)[OFFSET(90)], 2) AS price_p90,
-          ROUND(MAX(IF(matched_tokens >= @required, price, NULL)), 2) AS price_max
-        FROM scored
-        """
-
-        rows2 = _run_bq(sql_relax, params2, client)
-        r1 = rows2[0] if rows2 else None
-
-        source_count = int((r1.get("source_count") if r1 else 0) or 0)
-        price_min = float(r1.get("price_min")) if r1 and r1.get("price_min") is not None else None
-        price_median = float(r1.get("price_median")) if r1 and r1.get("price_median") is not None else None
-        price_p90 = float(r1.get("price_p90")) if r1 and r1.get("price_p90") is not None else None
-        price_max = float(r1.get("price_max")) if r1 and r1.get("price_max") is not None else None
-
-    confidence = _compute_confidence(source_count, len(tokens), used_relax)
-    verdict = _compute_verdict(unit_price, price_p90, price_median, source_count, confidence)
-
-    ratio_to_p90 = None
-    if unit_price is not None and price_p90 is not None and price_p90 > 0:
-        ratio_to_p90 = round(unit_price / price_p90, 4)
-
-    tokens_used_csv = ", ".join(tokens)
-
-    dbg: Dict[str, Any] = {}
     if payload.debug:
-        dbg = {
+        resp.debug = {
             "table_fqn": table_fqn,
+            "sql": sql,
             "tokens_used": tokens,
             "brand_filter": brand or None,
             "min_price": min_price,
-            "noise_filter": noise_filter,
-            "mode": "relax" if used_relax else "strict",
-            "strict_min_sources_threshold": fallback_threshold,
+            "noise_filter": True,
+            "price_p90": resp.price_p90,
             "identity": {
                 "bq_client_project": getattr(client, "project", None),
-                "bq_location_env": os.getenv("BQ_LOCATION", "").strip() or None,
-            },
-            "sql": (sql_relax if used_relax else sql_strict),
+                "bq_location_env": os.getenv("BQ_LOCATION", None),
+            }
         }
 
-    return PriceLookupResponse(
-        source_count=source_count,
-        price_min=price_min,
-        price_median=price_median,
-        price_p90=price_p90,
-        price_max=price_max,
-        tokens_used=tokens,
-        tokens_used_csv=tokens_used_csv,
-        verdict=verdict,
-        confidence=confidence,
-        ratio_to_p90=ratio_to_p90,
-        debug=dbg
-    )
+    return resp
 
 
 # =========================
@@ -1228,10 +1126,12 @@ def price_lookup(payload: PriceLookupRequest):
 def health():
     return {"ok": True}
 
+
 @app.post("/process_deviz_url", response_model=DevizResponse)
 def process_deviz_url(payload: DevizUrlPayload):
     image_bytes = _download_file(payload.url)
     return _process_image(image_bytes)
+
 
 @app.post("/process_deviz_file", response_model=DevizResponse)
 async def process_deviz_file(file: UploadFile = File(...)):
