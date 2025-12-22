@@ -546,11 +546,11 @@ def internal_deviz_check(payload: DevizInternalInput) -> DevizInternalResult:
     score_i = _clamp_score(score)
 
     # praguri un pic mai dure ca sa nu iasa “OK” prea usor
-    if score_i >= 86:
+       if score_i >= 80:
         verdict = "OK"
     elif score_i >= 65:
         verdict = "SUSPICIOUS"
-    elif score_i >= 40:
+    elif score_i >= 45:
         verdict = "BAD"
     else:
         verdict = "INSUFFICIENT_DATA"
