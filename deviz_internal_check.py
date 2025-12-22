@@ -53,9 +53,10 @@ def _safe_ratio(a: Optional[float], b: Optional[float]) -> Optional[float]:
     try:
         if a is None or b is None:
             return None
+        b = float(b)
         if b == 0:
             return None
-        return float(a) / float(b)
+        return float(a) / b
     except Exception:
         return None
 
@@ -63,8 +64,14 @@ def _clamp_score(x: float) -> int:
     return max(1, min(100, int(round(x))))
 
 def _approx(a: float, b: float, tol_abs: float, tol_rel: float) -> bool:
-    # True daca |a-b| <= max(tol_abs, |b|*tol_rel)
     return abs(a - b) <= max(tol_abs, abs(b) * tol_rel)
+
+def _sum_if_present(vals: List[Optional[float]]) -> Optional[float]:
+    # returneaza suma doar daca exista cel putin o valoare nenula
+    ok = [v for v in vals if v is not None]
+    if not ok:
+        return None
+    return float(sum(float(v) for v in ok))
 
 # =========================
 # CORE LOGIC
@@ -86,20 +93,21 @@ def internal_deviz_check(payload: DevizInternalInput) -> DevizInternalResult:
     dbg["labor_count"] = len(labor)
 
     # =========================
-    # 0) Detect partial payload (foarte important pt Make logs per-line)
+    # 0) Detect partial payload (important pt Make logs per-line)
     # =========================
     partial_payload = False
     partial_reasons: List[str] = []
 
-    if totals.labor is not None and totals.labor > 0 and len(labor) == 0:
+    # semnal puternic: totals cer comparatie dar items lipsesc pe categoria respectiva
+    if (totals.labor is not None and float(totals.labor) > 0) and len(labor) == 0:
         partial_payload = True
         partial_reasons.append("totals_has_labor_but_no_labor_items")
 
-    if totals.materials is not None and totals.materials > 0 and len(parts) == 0:
+    if (totals.materials is not None and float(totals.materials) > 0) and len(parts) == 0:
         partial_payload = True
         partial_reasons.append("totals_has_materials_but_no_part_items")
 
-    # daca ai foarte putine items, e foarte probabil ca rulezi check-ul pe o singura linie
+    # foarte putine items => probabil rulezi check-ul pe o singura linie
     if len(items) <= 1:
         partial_payload = True
         partial_reasons.append("too_few_items_for_totals_checks")
@@ -157,32 +165,54 @@ def internal_deviz_check(payload: DevizInternalInput) -> DevizInternalResult:
     dbg["sum_labor"] = sum_labor
     dbg["sum_all"] = sum_all
 
+    # tolerante un pic mai stricte ca sa nu fie totul "OK" (dar tot safe pt OCR)
+    def _tol_total(x: float, base_abs: float, base_rel: float) -> float:
+        return max(base_abs, abs(float(x)) * base_rel)
+
     if not partial_payload:
         if totals.materials is not None:
-            tol = max(5.0, float(totals.materials) * 0.05)
-            if abs(sum_parts - float(totals.materials)) > tol:
+            tv = float(totals.materials)
+            if abs(sum_parts - tv) > _tol_total(tv, base_abs=5.0, base_rel=0.04):
                 flags.append("materials_total_mismatch")
-                score -= 10
+                score -= 12
 
         if totals.labor is not None:
-            tol = max(5.0, float(totals.labor) * 0.05)
-            if abs(sum_labor - float(totals.labor)) > tol:
+            tv = float(totals.labor)
+            if abs(sum_labor - tv) > _tol_total(tv, base_abs=5.0, base_rel=0.04):
                 flags.append("labor_total_mismatch")
-                score -= 10
+                score -= 12
 
         if totals.grand_total is not None:
-            tol = max(10.0, float(totals.grand_total) * 0.05)
-            if abs(sum_all - float(totals.grand_total)) > tol:
+            tv = float(totals.grand_total)
+            if abs(sum_all - tv) > _tol_total(tv, base_abs=10.0, base_rel=0.03):
                 flags.append("grand_total_mismatch")
-                score -= 15
+                score -= 18
     else:
         # doar semnalam, fara penalty
-        if totals.materials is not None and totals.materials > 0 and len(parts) == 0:
+        if totals.materials is not None and float(totals.materials) > 0 and len(parts) == 0:
             flags.append("partial_payload_skipped_materials_total_check")
-        if totals.labor is not None and totals.labor > 0 and len(labor) == 0:
+        if totals.labor is not None and float(totals.labor) > 0 and len(labor) == 0:
             flags.append("partial_payload_skipped_labor_total_check")
-        if totals.grand_total is not None and totals.grand_total > 0 and len(items) <= 1:
+        if totals.grand_total is not None and float(totals.grand_total) > 0 and len(items) <= 1:
             flags.append("partial_payload_skipped_grand_total_check")
+
+    # =========================
+    # 2b) Net vs Total sanity (intra si cand nu ai subtotal_no_vat)
+    # =========================
+    # net_from_totals = materials + labor (daca exista macar una)
+    net_from_totals = _sum_if_present([totals.materials, totals.labor])
+    dbg["net_from_totals"] = net_from_totals
+
+    if not partial_payload and totals.grand_total is not None and net_from_totals is not None:
+        gt = float(totals.grand_total)
+        net = float(net_from_totals)
+        if gt > 0 and net > 0:
+            ratio = gt / net
+            dbg["grand_over_net_ratio"] = ratio
+            # cu TVA (19%) ar trebui sa fie ~1.19; fara TVA ~1.00
+            if ratio < 0.93 or ratio > 1.35:
+                flags.append("grand_total_vs_net_suspicious")
+                score -= 10
 
     # =========================
     # 3) Labor sanity
@@ -193,8 +223,8 @@ def internal_deviz_check(payload: DevizInternalInput) -> DevizInternalResult:
         dbg["labor_value"] = 0.0
         dbg["labor_hourly_rate"] = None
     else:
-        labor_hours = sum(float(i.qty or 0.0) for i in labor if (i.qty or 0.0) > 0)
-        labor_value = sum(float(i.line_total or 0.0) for i in labor if (i.line_total or 0.0) > 0)
+        labor_hours = sum(float(i.qty or 0.0) for i in labor if float(i.qty or 0.0) > 0)
+        labor_value = sum(float(i.line_total or 0.0) for i in labor if float(i.line_total or 0.0) > 0)
         hourly_rate = _safe_ratio(labor_value, labor_hours)
 
         dbg["labor_hours"] = labor_hours
@@ -203,11 +233,12 @@ def internal_deviz_check(payload: DevizInternalInput) -> DevizInternalResult:
 
         if labor_hours == 0 or hourly_rate is None:
             labor_sanity = "FAIL"
-            score -= 15
+            score -= 18
             flags.append("labor_missing_hours_or_rate")
-        elif hourly_rate < 30 or hourly_rate > 400:
+        elif hourly_rate < 40 or hourly_rate > 450:
+            # praguri un pic mai realiste (service-uri sar usor de 30)
             labor_sanity = "WARN"
-            score -= 5
+            score -= 8
             flags.append("labor_hourly_rate_suspicious")
         else:
             labor_sanity = "OK"
@@ -217,34 +248,42 @@ def internal_deviz_check(payload: DevizInternalInput) -> DevizInternalResult:
     # =========================
     vat_check = "NOT_APPLICABLE"
 
+    # (A) avem TVA si net
     if totals.vat is not None and totals.subtotal_no_vat is not None:
         expected_vat = float(totals.subtotal_no_vat) * 0.19
         tol = max(2.0, expected_vat * 0.05)
         if abs(expected_vat - float(totals.vat)) > tol:
             vat_check = "INCONSISTENT"
-            score -= 10
+            score -= 12
             flags.append("vat_inconsistent")
         else:
             vat_check = "OK"
 
+    # (B) n-avem TVA explicit
     elif totals.vat is None:
-        # daca avem net + total, TVA lipseste
+        # daca avem net + total, TVA lipseste in campuri (dar putem valida)
         if totals.grand_total is not None and totals.subtotal_no_vat is not None:
             vat_check = "MISSING"
-            score -= 5
+            score -= 6
             flags.append("vat_missing")
         else:
-            # incearca infer: daca avem (materials+labor) si grand_total
-            net = None
-            if totals.materials is not None or totals.labor is not None:
-                net = float(totals.materials or 0.0) + float(totals.labor or 0.0)
+            # infer: daca avem grand_total si un "net" plauzibil (prefer subtotal_no_vat, altfel materials+labor)
+            base_net = None
+            if totals.subtotal_no_vat is not None and float(totals.subtotal_no_vat) > 0:
+                base_net = float(totals.subtotal_no_vat)
+                dbg["vat_infer_base"] = "subtotal_no_vat"
+            elif net_from_totals is not None and float(net_from_totals) > 0:
+                base_net = float(net_from_totals)
+                dbg["vat_infer_base"] = "materials_plus_labor"
+            else:
+                base_net = None
 
-            if net is not None and totals.grand_total is not None and net > 0 and float(totals.grand_total) > 0:
-                inferred_vat = float(totals.grand_total) - net
-                dbg["vat_inferred_from_grand_minus_net"] = inferred_vat
+            if base_net is not None and totals.grand_total is not None and float(totals.grand_total) > 0:
+                inferred_vat = float(totals.grand_total) - base_net
+                dbg["vat_inferred_amount"] = inferred_vat
 
-                # valid doar daca seamana cu 19% din net (cu toleranta)
-                if inferred_vat > 0 and _approx(inferred_vat, net * 0.19, tol_abs=5.0, tol_rel=0.08):
+                # acceptam TVA daca seamana cu 19% din baza
+                if inferred_vat > 0 and _approx(inferred_vat, base_net * 0.19, tol_abs=5.0, tol_rel=0.08):
                     vat_check = "OK"
                     flags.append("vat_inferred")
                 else:
@@ -252,20 +291,27 @@ def internal_deviz_check(payload: DevizInternalInput) -> DevizInternalResult:
             else:
                 vat_check = "NOT_APPLICABLE"
 
+    # (C) totals.vat exista dar n-avem baza net
     else:
-        # totals.vat exista dar nu avem net
         vat_check = "INSUFFICIENT_DATA"
 
     # =========================
     # 5) Structura deviz (sanity)
     # =========================
-    # aici iar: daca payload e partial, nu penalizam "no_parts/too_few_items"
+    # daca payload e partial, nu penalizam "no_parts/too_few_items"
     if not partial_payload:
         if len(parts) == 0:
             flags.append("no_parts")
-            score -= 20
+            score -= 22
         if len(items) < 3:
             flags.append("too_few_items")
+            score -= 12
+        # si un semnal simplu: daca ai doar 1 tip de items, e dubios pt devize reale
+        if len(parts) == 0 and len(labor) > 0:
+            flags.append("only_labor_items")
+            score -= 8
+        if len(labor) == 0 and len(parts) > 0 and (totals.labor is not None and float(totals.labor) > 0):
+            flags.append("labor_totals_present_but_no_labor_items")
             score -= 10
     else:
         flags.append("partial_payload")
@@ -275,11 +321,11 @@ def internal_deviz_check(payload: DevizInternalInput) -> DevizInternalResult:
     # =========================
     score_i = _clamp_score(score)
 
-    if score_i >= 80:
+    if score_i >= 82:
         verdict = "OK"
-    elif score_i >= 55:
+    elif score_i >= 60:
         verdict = "SUSPICIOUS"
-    elif score_i >= 30:
+    elif score_i >= 35:
         verdict = "BAD"
     else:
         verdict = "INSUFFICIENT_DATA"
