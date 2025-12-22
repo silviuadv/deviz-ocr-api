@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel, Field
+from deviz_internal_check import internal_deviz_check
 
 # --- BigQuery imports (safe) ---
 try:
@@ -976,10 +977,25 @@ def _process_image(image_bytes: bytes) -> DevizResponse:
             "primary_failed_reasons": reasons,
             "primary_used_parser": primary.debug.get("used_parser"),
         })
+
+        # 🔹 INTERNAL CHECK (SAFE)
+        internal = internal_deviz_check(
+            items=fb.items,
+            totals=fb.totals
+        )
+        fb.debug["internal_check"] = internal
+
         return fb
 
     if not ok:
         primary.warnings = (primary.warnings or []) + ["primary_low_confidence: " + ",".join(reasons)]
+
+    # 🔹 INTERNAL CHECK (SAFE)
+    internal = internal_deviz_check(
+        items=primary.items,
+        totals=primary.totals
+    )
+    primary.debug["internal_check"] = internal
 
     return primary
 
