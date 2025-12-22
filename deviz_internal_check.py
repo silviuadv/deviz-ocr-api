@@ -1,6 +1,8 @@
 from typing import List, Dict, Any, Optional
+from fastapi import APIRouter
 from pydantic import BaseModel
-import math
+
+router = APIRouter()
 
 
 # =========================
@@ -8,13 +10,13 @@ import math
 # =========================
 
 class ExtractedItem(BaseModel):
-    desc: str
+    desc: str = ""
     kind: str                 # "part" | "labor"
-    qty: float
-    unit: str
-    unit_price: float
-    line_total: float
-    currency: str
+    qty: float = 0.0
+    unit: str = ""
+    unit_price: float = 0.0
+    line_total: float = 0.0
+    currency: str = "RON"
 
 
 class Totals(BaseModel):
@@ -27,8 +29,8 @@ class Totals(BaseModel):
 
 
 class DevizInternalInput(BaseModel):
-    items: List[ExtractedItem]
-    totals: Totals
+    items: List[ExtractedItem] = []
+    totals: Totals = Totals()
 
 
 # =========================
@@ -42,7 +44,7 @@ class DevizInternalResult(BaseModel):
     LaborSanityResult: str                          # OK / WARN / FAIL / SKIPPED
     MathConsistency: str                            # OK / MISMATCH / INSUFFICIENT_DATA
     VATCheck: str                                   # OK / MISSING / INCONSISTENT / NOT_APPLICABLE
-    debug: Dict[str, Any]
+    debug: Dict[str, Any] = {}
 
 
 # =========================
@@ -68,11 +70,11 @@ def internal_deviz_check(payload: DevizInternalInput) -> DevizInternalResult:
     score = 100.0
     dbg: Dict[str, Any] = {}
 
-    items = payload.items
-    totals = payload.totals
+    items = payload.items or []
+    totals = payload.totals or Totals()
 
-    parts = [i for i in items if i.kind == "part"]
-    labor = [i for i in items if i.kind == "labor"]
+    parts = [i for i in items if (i.kind or "").lower() == "part"]
+    labor = [i for i in items if (i.kind or "").lower() == "labor"]
 
     # =========================
     # 1. Math consistency (linie)
@@ -80,25 +82,26 @@ def internal_deviz_check(payload: DevizInternalInput) -> DevizInternalResult:
 
     mismatches = 0
     for it in items:
-        if it.qty > 0 and it.unit_price > 0:
-            expected = it.qty * it.unit_price
-            if abs(expected - it.line_total) > max(2.0, expected * 0.05):
+        if (it.qty or 0) > 0 and (it.unit_price or 0) > 0:
+            expected = float(it.qty) * float(it.unit_price)
+            tol = max(2.0, expected * 0.05)  # 2 RON sau 5%
+            if abs(expected - float(it.line_total or 0.0)) > tol:
                 mismatches += 1
-
-    if mismatches == 0:
-        math_consistency = "OK"
-    elif mismatches <= 2:
-        math_consistency = "MISMATCH"
-        score -= mismatches * 5
-        flags.append("line_math_mismatch")
-    else:
-        math_consistency = "MISMATCH"
-        score -= 15
-        flags.append("multiple_line_math_mismatches")
 
     if len(items) < 2:
         math_consistency = "INSUFFICIENT_DATA"
         score -= 10
+    else:
+        if mismatches == 0:
+            math_consistency = "OK"
+        elif mismatches <= 2:
+            math_consistency = "MISMATCH"
+            score -= mismatches * 5
+            flags.append("line_math_mismatch")
+        else:
+            math_consistency = "MISMATCH"
+            score -= 15
+            flags.append("multiple_line_math_mismatches")
 
     dbg["line_math_mismatches"] = mismatches
 
@@ -106,22 +109,25 @@ def internal_deviz_check(payload: DevizInternalInput) -> DevizInternalResult:
     # 2. Totaluri vs suma linii
     # =========================
 
-    sum_parts = sum(i.line_total for i in parts)
-    sum_labor = sum(i.line_total for i in labor)
-    sum_all = sum(i.line_total for i in items)
+    sum_parts = sum(float(i.line_total or 0.0) for i in parts)
+    sum_labor = sum(float(i.line_total or 0.0) for i in labor)
+    sum_all = sum(float(i.line_total or 0.0) for i in items)
 
     if totals.materials is not None:
-        if abs(sum_parts - totals.materials) > max(5.0, totals.materials * 0.05):
+        tol = max(5.0, float(totals.materials) * 0.05)
+        if abs(sum_parts - float(totals.materials)) > tol:
             flags.append("materials_total_mismatch")
             score -= 10
 
     if totals.labor is not None:
-        if abs(sum_labor - totals.labor) > max(5.0, totals.labor * 0.05):
+        tol = max(5.0, float(totals.labor) * 0.05)
+        if abs(sum_labor - float(totals.labor)) > tol:
             flags.append("labor_total_mismatch")
             score -= 10
 
     if totals.grand_total is not None:
-        if abs(sum_all - totals.grand_total) > max(10.0, totals.grand_total * 0.05):
+        tol = max(10.0, float(totals.grand_total) * 0.05)
+        if abs(sum_all - float(totals.grand_total)) > tol:
             flags.append("grand_total_mismatch")
             score -= 15
 
@@ -135,9 +141,12 @@ def internal_deviz_check(payload: DevizInternalInput) -> DevizInternalResult:
 
     if len(labor) == 0:
         labor_sanity = "SKIPPED"
+        dbg["labor_hours"] = 0.0
+        dbg["labor_value"] = 0.0
+        dbg["labor_hourly_rate"] = None
     else:
-        labor_hours = sum(i.qty for i in labor if i.qty > 0)
-        labor_value = sum(i.line_total for i in labor if i.line_total > 0)
+        labor_hours = sum(float(i.qty or 0.0) for i in labor if (i.qty or 0.0) > 0)
+        labor_value = sum(float(i.line_total or 0.0) for i in labor if (i.line_total or 0.0) > 0)
 
         hourly_rate = _safe_ratio(labor_value, labor_hours)
 
@@ -157,7 +166,7 @@ def internal_deviz_check(payload: DevizInternalInput) -> DevizInternalResult:
             labor_sanity = "OK"
 
     # =========================
-    # 4. TVA logic
+    # 4. TVA logic (doar daca exista date)
     # =========================
 
     if totals.vat is None:
@@ -169,8 +178,9 @@ def internal_deviz_check(payload: DevizInternalInput) -> DevizInternalResult:
             flags.append("vat_missing")
     else:
         if totals.subtotal_no_vat is not None:
-            expected_vat = totals.subtotal_no_vat * 0.19
-            if abs(expected_vat - totals.vat) > max(2.0, expected_vat * 0.05):
+            expected_vat = float(totals.subtotal_no_vat) * 0.19
+            tol = max(2.0, expected_vat * 0.05)
+            if abs(expected_vat - float(totals.vat)) > tol:
                 vat_check = "INCONSISTENT"
                 score -= 10
                 flags.append("vat_inconsistent")
@@ -180,7 +190,7 @@ def internal_deviz_check(payload: DevizInternalInput) -> DevizInternalResult:
             vat_check = "INSUFFICIENT_DATA"
 
     # =========================
-    # 5. Structura deviz
+    # 5. Structura deviz (sanity)
     # =========================
 
     if len(parts) == 0:
@@ -195,19 +205,19 @@ def internal_deviz_check(payload: DevizInternalInput) -> DevizInternalResult:
     # 6. Verdict final
     # =========================
 
-    score = _clamp_score(score)
+    score_i = _clamp_score(score)
 
-    if score >= 80:
+    if score_i >= 80:
         verdict = "OK"
-    elif score >= 55:
+    elif score_i >= 55:
         verdict = "SUSPICIOUS"
-    elif score >= 30:
+    elif score_i >= 30:
         verdict = "BAD"
     else:
         verdict = "INSUFFICIENT_DATA"
 
     return DevizInternalResult(
-        InternalScore=score,
+        InternalScore=score_i,
         InternalVerdict=verdict,
         InternalFlags=", ".join(flags) if flags else "",
         LaborSanityResult=labor_sanity,
@@ -215,3 +225,12 @@ def internal_deviz_check(payload: DevizInternalInput) -> DevizInternalResult:
         VATCheck=vat_check,
         debug=dbg
     )
+
+
+# =========================
+# FASTAPI ENDPOINT (ce face sa apara in /docs)
+# =========================
+
+@router.post("/deviz_internal_check", response_model=DevizInternalResult)
+def deviz_internal_check_endpoint(payload: DevizInternalInput) -> DevizInternalResult:
+    return internal_deviz_check(payload)
