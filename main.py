@@ -1009,6 +1009,9 @@ class PriceLookupRequest(BaseModel):
 
     # optional, for verdict/ratio
     unit_price: Optional[float] = None
+    qty: Optional[float] = None
+    line_total: Optional[float] = None
+
     currency: Optional[str] = "RON"
     vehicle: Optional[str] = None
 
@@ -1034,7 +1037,9 @@ _FEED_STOPWORDS = {
     "si", "sau", "cu", "din", "de", "la", "pe", "ptr", "pentru",
     "set", "kit", "buc", "buc.", "uc", "um", "u.m", "um.", "pcs",
     "lei", "ron", "tva", "total", "pret", "valoare", "cantitate",
-    "manopera", "operatie", "revizie", "generala"
+    "manopera", "operatie", "revizie", "generala",
+    # labor-ish verbs that often contaminate desc in devize
+    "inlocuit", "inlocuire", "schimb", "schimbare", "montare", "reparatie", "verificare", "control", "testare"
 }
 
 _NOISE_REGEX = r"\b(compatibil|potrivit|se potriveste|nu include|fara|universal|set complet|cadou)\b"
@@ -1095,32 +1100,69 @@ def _bq_table_fqn() -> str:
         raise HTTPException(status_code=500, detail="Server missing BQ_PROJECT/BQ_DATASET/BQ_TABLE")
     return f"`{project}.{dataset}.{table}`"
 
-def _compute_market_confidence(source_count: int, tokens_used: List[str]) -> str:
+def _safe_ratio(a: Optional[float], b: Optional[float]) -> Optional[float]:
+    try:
+        if a is None or b is None:
+            return None
+        if b <= 0:
+            return None
+        return float(a) / float(b)
+    except Exception:
+        return None
+
+def _derive_unit_price(payload: PriceLookupRequest) -> Tuple[Optional[float], bool]:
+    # Returns (unit_price, derived_flag)
+    if payload.unit_price is not None and payload.unit_price > 0:
+        return float(payload.unit_price), False
+    if payload.line_total is not None and payload.qty is not None and payload.qty > 0:
+        up = float(payload.line_total) / float(payload.qty)
+        if up > 0:
+            return up, True
+    return None, False
+
+def _compute_market_confidence(source_count: int, tokens_used: List[str], price_median: Optional[float], price_p90: Optional[float]) -> str:
     # Must match Airtable single-select options EXACT: LOW / MED / HIGH
     t = len(tokens_used or [])
-    if source_count >= 200 and t >= 2:
+    spread = _safe_ratio(price_p90, price_median)  # p90/median
+    if source_count >= 200 and t >= 2 and (spread is None or spread <= 6.0):
         return "HIGH"
-    if source_count >= 50 and t >= 1:
+    if source_count >= 50 and t >= 1 and (spread is None or spread <= 12.0):
         return "MED"
     return "LOW"
 
-def _compute_market_verdict(source_count: int, unit_price: Optional[float], price_p90: Optional[float]) -> Tuple[str, Optional[float]]:
+def _compute_market_verdict(
+    source_count: int,
+    unit_price: Optional[float],
+    price_median: Optional[float],
+    price_p90: Optional[float]
+) -> Tuple[str, Optional[float]]:
     # Must match Airtable single-select options EXACT:
     # ok | suspect_overpriced | suspect_underpriced | insufficient_data | NO_DATA
-    if source_count <= 0 or price_p90 is None:
+
+    if source_count <= 0 or price_p90 is None or price_median is None:
         return "NO_DATA", None
+
+    # If we don't have a unit price (yet), we still have a market distribution: call it ok, but ratio unknown
     if unit_price is None or unit_price <= 0:
-        return "insufficient_data", None
+        return "ok", None
 
-    ratio = unit_price / price_p90 if price_p90 > 0 else None
-    if ratio is None:
-        return "insufficient_data", None
+    # If market is too small, it's truly insufficient
+    if source_count < 30:
+        return "insufficient_data", _safe_ratio(unit_price, price_p90)
 
-    # thresholds (tweakable)
-    if ratio >= 1.50:
+    spread = _safe_ratio(price_p90, price_median)  # p90/median
+    # If tokens match is too "wide", verdict is unreliable => insufficient_data
+    if spread is not None and spread > 25.0:
+        return "insufficient_data", _safe_ratio(unit_price, price_p90)
+
+    ratio = _safe_ratio(unit_price, price_p90)
+
+    # thresholds (stable)
+    if price_p90 is not None and unit_price >= (price_p90 * 1.30):
         return "suspect_overpriced", ratio
-    if ratio <= 0.60:
+    if price_median is not None and unit_price <= (price_median * 0.50):
         return "suspect_underpriced", ratio
+
     return "ok", ratio
 
 
@@ -1194,8 +1236,9 @@ def price_lookup(payload: PriceLookupRequest):
         raise HTTPException(status_code=502, detail=f"BigQuery query failed: {e}")
 
     if not rows:
-        conf = _compute_market_confidence(0, tokens)
-        verdict, ratio = _compute_market_verdict(0, payload.unit_price, None)
+        conf = "LOW"
+        verdict = "NO_DATA"
+        ratio = None
         return PriceLookupResponse(
             source_count=0,
             tokens_used=tokens,
@@ -1212,11 +1255,14 @@ def price_lookup(payload: PriceLookupRequest):
     price_max = float(r0.get("price_max")) if r0.get("price_max") is not None else None
     price_p90 = float(r0.get("price_p90")) if r0.get("price_p90") is not None else None
 
-    conf = _compute_market_confidence(source_count, tokens)
-    verdict, ratio = _compute_market_verdict(source_count, payload.unit_price, price_p90)
+    unit_price, derived_flag = _derive_unit_price(payload)
+
+    conf = _compute_market_confidence(source_count, tokens, price_median, price_p90)
+    verdict, ratio = _compute_market_verdict(source_count, unit_price, price_median, price_p90)
 
     dbg: Dict[str, Any] = {}
     if payload.debug:
+        spread = _safe_ratio(price_p90, price_median)
         dbg = {
             "table_fqn": table_fqn,
             "sql": sql,
@@ -1224,6 +1270,9 @@ def price_lookup(payload: PriceLookupRequest):
             "brand_filter": brand or None,
             "min_price": min_price,
             "noise_filter": bool(payload.noise_filter),
+            "derived_unit_price": bool(derived_flag),
+            "unit_price_used": unit_price,
+            "spread_p90_over_median": spread,
             "identity": {
                 "bq_client_project": client.project,
                 "bq_location_env": bq_location,
