@@ -9,7 +9,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel, Field
 
 # ✅ UPDATE: import corect (payload model + functie)
-from deviz_internal_check import DevizInternalInput, internal_deviz_check
+from deviz_internal_check import internal_deviz_check, DevizInternalInput
 
 # --- BigQuery imports (safe) ---
 try:
@@ -994,9 +994,12 @@ def _process_image(image_bytes: bytes) -> DevizResponse:
 
         # ✅ UPDATE: INTERNAL CHECK (corect: trimiti payload)
         internal = internal_deviz_check(
-            DevizInternalInput(items=fb.items, totals=fb.totals)
+        DevizInternalInput(
+        items=fb.items,
+        totals=fb.totals
+            )
         )
-        fb.debug["internal_check"] = _bm_to_dict(internal)
+        fb.debug["internal_check"] = internal.model_dump()
 
         return fb
 
@@ -1005,9 +1008,12 @@ def _process_image(image_bytes: bytes) -> DevizResponse:
 
     # ✅ UPDATE: INTERNAL CHECK (corect: trimiti payload)
     internal = internal_deviz_check(
-        DevizInternalInput(items=primary.items, totals=primary.totals)
+    DevizInternalInput(
+        items=primary.items,
+        totals=primary.totals
+        )
     )
-    primary.debug["internal_check"] = _bm_to_dict(internal)
+    primary.debug["internal_check"] = internal.model_dump()
 
     return primary
 
