@@ -19,7 +19,7 @@ except Exception:
 
 app = FastAPI(
     title="Deviz Parser Hybrid: Vision Layout Primary + GPT Fallback",
-    version="0.3.0"
+    version="0.2.0"
 )
 
 # =========================
@@ -40,7 +40,7 @@ class ExtractedItem(BaseModel):
     line_total: float = 0.0
     currency: str = "RON"
     warnings: List[str] = Field(default_factory=list)
-    code: str = ""  # part code
+    code: str = ""  # part code (optional)
 
 
 class Totals(BaseModel):
@@ -95,11 +95,11 @@ def _safe_float(x: Any) -> Optional[float]:
 
         # Case B: only comma
         if "," in s and "." not in s:
-            # thousands grouping
+            # if looks like thousands grouping: 1,234 or 12,345,678
             if re.fullmatch(r"\d{1,3}(,\d{3})+(\.\d+)?", s):
                 s = s.replace(",", "")
                 return float(s)
-            # comma as decimal
+            # else assume comma is decimal separator: 123,45
             if re.fullmatch(r"\d+,\d{1,4}", s):
                 s = s.replace(",", ".")
                 return float(s)
@@ -136,7 +136,7 @@ def _approx_equal(a: Optional[float], b: Optional[float], tol: float = 2.0) -> b
 
 
 # =========================
-# CODE extraction + validation
+# CODE (part code) extraction + validation
 # =========================
 
 STOP_CODES = {
@@ -165,15 +165,15 @@ def _is_valid_part_code(code: str) -> bool:
     if _is_row_index_code(c):
         return False
 
-    # alphanumeric with letters+digits
+    # accept alfanumeric (min 4) care contine macar o litera si o cifra
     if len(c) >= 4 and re.search(r"[A-Za-z]", c) and re.search(r"\d", c):
         return True
 
-    # with separators
+    # accept coduri cu separatori
     if len(c) >= 6 and re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z\.\-_/]+", c) and re.search(r"[.\-_/]", c):
         return True
 
-    # numeric with dot segments: 365.372 etc
+    # accept numeric cu punct (ex: 365.372)
     if re.fullmatch(r"\d{2,6}(\.\d{2,6}){1,3}", c):
         return True
 
@@ -206,75 +206,53 @@ def _extract_code_from_text(raw_line: str, desc: str) -> Tuple[str, str]:
 
 
 # =========================
-# Post-processing items (SAFE)
+# Heuristics: labor vs part (NO CODE REQUIRED)
 # =========================
 
-_TOTAL_MARKERS = [
-    "total", "subtotal", "total deviz", "total reparatie", "total manopera", "total materiale",
-    "cost reparatie", "tot.man", "tot. mat", "tva"
-]
-
-# verbs that usually indicate labor/operation lines (when there is no clear material structure)
 _LABOR_VERB_PREFIXES = [
-    "inlocuit", "inlocuire", "schimb", "revizie", "control", "testare", "verificare",
-    "montare", "demontare", "diagnostic", "reparatie", "reglaj", "curatare", "completare",
-    "programare", "resetare", "calibrare"
+    "inloc", "schimb", "reviz", "verific", "control", "test", "diagno",
+    "repar", "mont", "demont", "regl", "curat", "service", "inspect",
+    "reset", "adapt", "program", "calib", "spalat", "incarcat",
 ]
+_LABOR_WORDS = [
+    "manopera", "operatie", "lucrari", "lucrari solicitate", "servicii", "executate",
+    "inlocuire", "inlocuit", "schimb", "revizie", "verificare", "control", "testare",
+    "diagnoza", "diagnostic", "montare", "demontare", "reparatie", "reglaj", "curatare",
+]
+_PART_HINT_UNITS = ["buc", "buc.", "pcs", "set", "ltr", "l", "ml", "kg", "g", "rola", "kit", "u.m", "um", "um."]
 
-def _looks_like_total_line(desc: str, raw: str) -> bool:
-    s = (_norm_spaces(desc) + " " + _norm_spaces(raw)).lower()
-    if any(m in s for m in _TOTAL_MARKERS):
-        return True
-    # "2. TOTAL" etc
-    if re.fullmatch(r"\d+\.?\s*total.*", s.strip()):
-        return True
-    return False
+def _looks_like_labor(desc: str, raw_line: str) -> bool:
+    d = (desc or "").strip().lower()
+    r = (raw_line or "").strip().lower()
 
-def _looks_like_operation_line(desc: str, raw: str) -> bool:
-    d = (_norm_spaces(desc) or "").lower()
-    r = (_norm_spaces(raw) or "").lower()
-    # starts with verb-ish
-    if any(d.startswith(v) for v in _LABOR_VERB_PREFIXES):
+    if any(w in d for w in _LABOR_WORDS) or any(w in r for w in _LABOR_WORDS):
         return True
-    # patterns like "REVIZIE 0-" / "INLOCUIT ... 0-"
-    if "0-" in d or "0-" in r:
-        if any(v in d for v in _LABOR_VERB_PREFIXES) or any(v in r for v in _LABOR_VERB_PREFIXES):
+
+    # starts with a verb-ish word (REVIZIE, INLOCUIT, SCHIMB...)
+    first = d.split(" ")[0] if d else ""
+    for p in _LABOR_VERB_PREFIXES:
+        if first.startswith(p):
             return True
+
     return False
 
-def _postprocess_items(items: List[ExtractedItem]) -> List[ExtractedItem]:
-    out: List[ExtractedItem] = []
-    for it in (items or []):
-        desc = it.desc or ""
-        raw = it.raw or ""
-
-        # drop TOTAL/SUBTOTAL lines
-        if _looks_like_total_line(desc, raw):
-            continue
-
-        # If GPT marked as part but it's clearly an operation line, flip to labor
-        if (it.kind or "").lower() == "part":
-            if _looks_like_operation_line(desc, raw):
-                # do NOT touch real parts that have codes (strong signal it's a part)
-                if not (it.code and _is_valid_part_code(it.code)):
-                    it.kind = "labor"
-                    it.unit = "ore" if (it.unit or "").lower() in ["h", "ore", "ora", "oras"] else (it.unit or "")
-                    it.code = ""  # labor code empty
-
-        # Ensure labor never carries code
-        if (it.kind or "").lower() == "labor":
-            it.code = ""
-
-        out.append(it)
-    return out
+def _looks_like_part(desc: str, raw_line: str) -> bool:
+    d = (desc or "").strip().lower()
+    r = (raw_line or "").strip().lower()
+    if any(f" {u} " in f" {d} " for u in _PART_HINT_UNITS):
+        return True
+    if any(f" {u} " in f" {r} " for u in _PART_HINT_UNITS):
+        return True
+    return False
 
 
 # =========================
-# Google Vision OCR
+# Google Vision: OCR + layout (words with coords)
 # =========================
 
 class _Word:
     __slots__ = ("t", "x", "y", "h")
+
     def __init__(self, t: str, x: int, y: int, h: int):
         self.t = t
         self.x = x
@@ -376,23 +354,65 @@ def parse_generic_lines(lines: List[str], currency: str = "RON") -> List[Extract
     items: List[ExtractedItem] = []
 
     noise = [
-        "pagina", "lucrarile", "perioada", "certificat", "garantie",
-        "preturile nu contin tva", "generat cu autodeviz"
+        "pagina", "total deviz", "total materiale", "total manopera",
+        "lucrarile", "perioada", "certificat", "garantie",
+        "subtotal", "total", "tva", "total reparatie", "cost reparatie",
+        "preturile nu contin", "generat cu autodeviz",
     ]
 
     for line in lines:
         l = _norm_spaces(line)
-        if len(l) < 4:
+        if len(l) < 3:
             continue
-        if _contains_any(l, noise):
+        low = l.lower()
+        if _contains_any(low, noise):
             continue
 
-        # do not parse totals here
-        if _looks_like_total_line(l, l):
+        # also skip bare "TOTAL" lines
+        if re.fullmatch(r"(total|subtotal)\b.*", low):
             continue
 
         desc, nums = _split_tail_numbers(l)
+
+        # If no numbers at all, ignore (most headers)
+        if len(nums) < 1:
+            continue
+
+        # We accept 2+ numbers as a strong line item candidate, but also accept "0-" patterns
+        # Normalize weird "0-" endings (common OCR)
+        if desc.endswith("0-") and len(nums) == 1 and (nums[0] == 0):
+            # keep as a labor line, no price data
+            cleaned_desc = desc[:-2].strip()
+            if cleaned_desc:
+                items.append(ExtractedItem(
+                    raw=l,
+                    desc=cleaned_desc,
+                    kind="labor",
+                    qty=0.0,
+                    unit="",
+                    unit_price=0.0,
+                    line_total=0.0,
+                    currency=currency,
+                    warnings=["no_price_detected"],
+                    code=""
+                ))
+            continue
+
         if len(nums) < 2:
+            # if it looks like labor text (REVIZIE / INLOCUIT...) keep it as labor with 0 totals
+            if desc and _looks_like_labor(desc, l):
+                items.append(ExtractedItem(
+                    raw=l,
+                    desc=desc,
+                    kind="labor",
+                    qty=0.0,
+                    unit="",
+                    unit_price=0.0,
+                    line_total=0.0,
+                    currency=currency,
+                    warnings=["no_price_detected"],
+                    code=""
+                ))
             continue
 
         qty = nums[0]
@@ -407,22 +427,37 @@ def parse_generic_lines(lines: List[str], currency: str = "RON") -> List[Extract
                 if len(nums) == 2:
                     line_total = qty * unit_price
 
-        kind = "part"
-        unit = ""
-        dlow = desc.lower()
-        if "manopera" in dlow:
-            kind = "labor"
-            unit = "ore"
-            desc = re.sub(r"(?i)\bmanopera\b", "", desc).strip()
-
+        # clean row index
         desc = re.sub(r"^\d+\.?\s*", "", desc).strip()
         if not desc:
             continue
 
+        # kind decision (IMPORTANT)
+        kind = "part"
+        unit = ""
+        desc_low = desc.lower()
+
+        # explicit manopera keyword
+        if "manopera" in desc_low:
+            kind = "labor"
+            unit = "ore"
+            desc = re.sub(r"(?i)\bmanopera\b", "", desc).strip()
+        else:
+            # heuristic: labor verbs -> labor
+            if _looks_like_labor(desc, l) and not _looks_like_part(desc, l):
+                kind = "labor"
+
+        # code extraction only if part (but not required)
         code = ""
         desc2 = desc
         if kind == "part":
             code, desc2 = _extract_code_from_text(raw_line=l, desc=desc)
+        else:
+            code = ""
+
+        # final guard: if desc is basically total/subtotal, drop it
+        if re.fullmatch(r"(total|subtotal)\b.*", (desc2 or "").lower()):
+            continue
 
         items.append(ExtractedItem(
             raw=l,
@@ -441,7 +476,7 @@ def parse_generic_lines(lines: List[str], currency: str = "RON") -> List[Extract
 
 
 # =========================
-# Parser B (table aware - AutoDeviz)
+# Parser B (table aware) - AutoDeviz style
 # =========================
 
 def _detect_autodeviz_table(lines: List[str]) -> bool:
@@ -506,7 +541,7 @@ def _parse_autodeviz_rows(words: List[_Word], currency: str = "RON") -> List[Ext
 
     stop_markers = [
         "total manopera", "total materiale", "total reparatie", "cost reparatie",
-        "certificat", "preturile nu contin", "executant", "verificat"
+        "certificat", "preturile nu contin", "executant", "verificat", "total"
     ]
 
     for lw in lines_words[header_idx + 1:]:
@@ -516,9 +551,6 @@ def _parse_autodeviz_rows(words: List[_Word], currency: str = "RON") -> List[Ext
             continue
         if any(m in low for m in stop_markers):
             break
-
-        if _looks_like_total_line(text, text):
-            continue
 
         tokens = text.split()
         if not tokens:
@@ -552,11 +584,14 @@ def _parse_autodeviz_rows(words: List[_Word], currency: str = "RON") -> List[Ext
 
         tail_nums = [(idx, t) for idx, t in enumerate(rest) if token_is_num(t)]
         if tail_nums:
-            material_val = tok_float(tail_nums[-1][1])
+            idx_mv, tok_mv = tail_nums[-1]
+            material_val = tok_float(tok_mv)
         if len(tail_nums) >= 2:
-            unit_price = tok_float(tail_nums[-2][1])
+            idx_up, tok_up = tail_nums[-2]
+            unit_price = tok_float(tok_up)
         if len(tail_nums) >= 3:
-            qty = tok_float(tail_nums[-3][1])
+            idx_q, tok_q = tail_nums[-3]
+            qty = tok_float(tok_q)
 
         if qty is not None and unit_price is not None:
             qty_pos = None
@@ -580,6 +615,7 @@ def _parse_autodeviz_rows(words: List[_Word], currency: str = "RON") -> List[Ext
                 mat_tokens = rest[i_lval + 1: qty_pos2]
                 mat_desc = _norm_spaces(" ".join(mat_tokens)).strip(' "')
 
+        # labor item
         labor_unit_price = 0.0
         labor_warnings: List[str] = []
         if time_h > 0 and labor_val > 0:
@@ -600,6 +636,7 @@ def _parse_autodeviz_rows(words: List[_Word], currency: str = "RON") -> List[Ext
             code=""
         ))
 
+        # material item
         if mat_desc and qty is not None and unit_price is not None and material_val is not None:
             part_warnings: List[str] = []
             if abs((qty * unit_price) - material_val) > 2.0:
@@ -624,7 +661,7 @@ def _parse_autodeviz_rows(words: List[_Word], currency: str = "RON") -> List[Ext
 
 
 # =========================
-# Totals extraction
+# Totals extraction from raw text
 # =========================
 
 def _extract_totals_from_text(raw_text: str) -> Totals:
@@ -731,14 +768,16 @@ def _openai_fallback(image_bytes: bytes, raw_text: str) -> DevizResponse:
     prompt = (
         "Extrage date structurate dintr-un deviz auto in format JSON.\n"
         "Vreau sa returnezi:\n"
-        "- items: fiecare linie relevanta din manopera si piese (kind = 'labor' sau 'part')\n"
+        "- items: fiecare linie din manopera si piese (kind = 'labor' sau 'part')\n"
         "- totals: materials, labor, grand_total, currency (RON)\n"
-        "Reguli IMPORTANT:\n"
-        "- Nu inventa linii 'TOTAL' / 'SUBTOTAL' ca items. Daca vezi TOTAL/SUBTOTAL, NU le pune in items.\n"
-        "- Daca o linie e o operatie (ex: INLOCUIT, SCHIMB, REVIZIE, CONTROL, TESTARE, VERIFICARE), marcheaz-o ca kind='labor'.\n"
-        "- Daca o linie descrie o piesa/material (filtru, ulei, carcasa, capac, buson etc), marcheaz-o ca kind='part'.\n"
+        "- document: service_name, client_name, vehicle, date, number daca se vad\n"
+        "Reguli:\n"
+        "- Nu inventa valori. Daca lipseste ceva, pune null sau 0 unde e numeric.\n"
+        "- Daca un rand contine si operatie si material, creeaza 2 items: unul labor si unul part.\n"
         "- Pentru piese, daca exista un cod (alfanumeric sau numeric cu punct), pune-l in field 'code'.\n"
         "- Daca nu exista cod, pune code=\"\".\n"
+        "- IMPORTANT: Linii de tip TOTAL / SUBTOTAL / TVA nu sunt items.\n"
+        "- IMPORTANT: Operatii ca 'REVIZIE', 'INLOCUIT', 'SCHIMB' sunt de obicei labor.\n"
     )
 
     req = {
@@ -793,18 +832,26 @@ def _openai_fallback(image_bytes: bytes, raw_text: str) -> DevizResponse:
     for it in (parsed.get("items") or []):
         try:
             obj = ExtractedItem(**it)
+            # normalize kind
+            if obj.kind not in ("part", "labor"):
+                obj.kind = "part"
+            # drop totals lines
+            if re.fullmatch(r"(total|subtotal|tva)\b.*", (obj.desc or "").strip().lower()):
+                continue
+            # enforce labor heuristic (no-code requirement)
+            if obj.kind == "part" and _looks_like_labor(obj.desc, obj.raw or "") and not _looks_like_part(obj.desc, obj.raw or ""):
+                obj.kind = "labor"
+                obj.code = ""
+            # validate code only for parts
             if obj.kind == "part":
                 obj.code = _clean_code_candidate(obj.code)
-                if not _is_valid_part_code(obj.code):
+                if obj.code and not _is_valid_part_code(obj.code):
                     obj.code = ""
             else:
                 obj.code = ""
             items.append(obj)
         except Exception:
             continue
-
-    # SAFE postprocess (fix total + labor/part mislabels)
-    items = _postprocess_items(items)
 
     resp = DevizResponse(
         document=DocumentMeta(**(parsed.get("document", {}) or {"default_currency": "RON"})),
@@ -868,8 +915,17 @@ def _build_response_from_primary(words: List[_Word], raw_text: str) -> DevizResp
         items = parse_generic_lines(lines, currency=currency)
         used_parser = "generic_lines"
 
-    # SAFE postprocess (total + labor/part mislabels)
-    items = _postprocess_items(items)
+    # post-pass: drop totals-ish and fix labor heuristics
+    cleaned: List[ExtractedItem] = []
+    for it in items:
+        dlow = (it.desc or "").strip().lower()
+        if re.fullmatch(r"(total|subtotal|tva)\b.*", dlow):
+            continue
+        if it.kind == "part" and _looks_like_labor(it.desc, it.raw or "") and not _looks_like_part(it.desc, it.raw or ""):
+            it.kind = "labor"
+            it.code = ""
+        cleaned.append(it)
+    items = cleaned
 
     sum_guess = sum((it.line_total or 0.0) for it in items) if items else None
 
@@ -929,7 +985,7 @@ def _process_image(image_bytes: bytes) -> DevizResponse:
 
 
 # =========================
-# Download helper
+# Download helper for URL endpoint
 # =========================
 
 def _download_file(url: str) -> bytes:
@@ -948,22 +1004,28 @@ class PriceLookupRequest(BaseModel):
     brand: Optional[str] = None
     min_price: float = 0.0
     token_limit: int = 6
-    observed_price: float = 0.0  # OPTIONAL: pretul din deviz (unit price sau line_total, cum vrei tu)
+    noise_filter: bool = True
     debug: bool = False
+
+    # optional, for verdict/ratio
+    unit_price: Optional[float] = None
+    currency: Optional[str] = "RON"
+    vehicle: Optional[str] = None
 
 
 class PriceLookupResponse(BaseModel):
     source_count: int = 0
-    price_min: float = 0.0
-    price_median: float = 0.0
-    price_max: float = 0.0
-    price_p90: float = 0.0
+    price_min: Optional[float] = None
+    price_median: Optional[float] = None
+    price_max: Optional[float] = None
+    price_p90: Optional[float] = None
+
     tokens_used: List[str] = Field(default_factory=list)
 
-    # IMPORTANT: astea trebuie la top-level ca sa apara ca label in Make
-    MarketVerdict: str = ""
-    MarketConfidence: float = 0.0
-    MarketRatioToP90: float = 0.0
+    # Airtable-friendly outputs (do NOT rename)
+    market_verdict: str = "NO_DATA"         # ok | suspect_overpriced | suspect_underpriced | insufficient_data | NO_DATA
+    market_confidence: str = "LOW"          # LOW | MED | HIGH
+    market_ratio_to_p90: Optional[float] = None
 
     debug: Dict[str, Any] = Field(default_factory=dict)
 
@@ -976,6 +1038,7 @@ _FEED_STOPWORDS = {
 }
 
 _NOISE_REGEX = r"\b(compatibil|potrivit|se potriveste|nu include|fara|universal|set complet|cadou)\b"
+
 
 def _normalize_for_search(s: str) -> str:
     s = (s or "").lower().strip()
@@ -1021,8 +1084,7 @@ def _get_bq_client() -> "bigquery.Client":
     if not project:
         raise HTTPException(status_code=500, detail="Server missing BQ_PROJECT (and no project_id in credentials)")
 
-    location = os.getenv("BQ_LOCATION", "").strip() or None
-    client = bigquery.Client(project=project, credentials=creds, location=location)
+    client = bigquery.Client(project=project, credentials=creds)
     return client
 
 def _bq_table_fqn() -> str:
@@ -1033,65 +1095,80 @@ def _bq_table_fqn() -> str:
         raise HTTPException(status_code=500, detail="Server missing BQ_PROJECT/BQ_DATASET/BQ_TABLE")
     return f"`{project}.{dataset}.{table}`"
 
-def _market_verdict(observed: float, p90: float, source_count: int) -> Tuple[str, float, float]:
-    """
-    Return (verdict, confidence, ratio_to_p90)
-    - verdict: ok / suspect / teapa / unknown
-    - confidence: 0..1
-    - ratio_to_p90: observed/p90 (0 if not computable)
-    """
-    obs = float(observed or 0.0)
-    p = float(p90 or 0.0)
-    if obs <= 0 or p <= 0 or source_count <= 0:
-        return ("unknown", 0.0, 0.0)
+def _compute_market_confidence(source_count: int, tokens_used: List[str]) -> str:
+    # Must match Airtable single-select options EXACT: LOW / MED / HIGH
+    t = len(tokens_used or [])
+    if source_count >= 200 and t >= 2:
+        return "HIGH"
+    if source_count >= 50 and t >= 1:
+        return "MED"
+    return "LOW"
 
-    ratio = obs / p
+def _compute_market_verdict(source_count: int, unit_price: Optional[float], price_p90: Optional[float]) -> Tuple[str, Optional[float]]:
+    # Must match Airtable single-select options EXACT:
+    # ok | suspect_overpriced | suspect_underpriced | insufficient_data | NO_DATA
+    if source_count <= 0 or price_p90 is None:
+        return "NO_DATA", None
+    if unit_price is None or unit_price <= 0:
+        return "insufficient_data", None
 
-    # confidence based on source_count (simple & stable)
-    # 0..1 grows with more sources, saturates ~200
-    conf = min(1.0, max(0.0, (source_count / 200.0)))
+    ratio = unit_price / price_p90 if price_p90 > 0 else None
+    if ratio is None:
+        return "insufficient_data", None
 
-    # verdict thresholds (tweakable later)
-    if ratio <= 1.10:
-        return ("ok", conf, ratio)
-    if ratio <= 1.35:
-        return ("suspect", conf, ratio)
-    return ("teapa", conf, ratio)
+    # thresholds (tweakable)
+    if ratio >= 1.50:
+        return "suspect_overpriced", ratio
+    if ratio <= 0.60:
+        return "suspect_underpriced", ratio
+    return "ok", ratio
+
 
 @app.post("/price_lookup", response_model=PriceLookupResponse)
 def price_lookup(payload: PriceLookupRequest):
     desc = _norm_spaces(payload.desc or "")
     if not desc:
-        return PriceLookupResponse(source_count=0, tokens_used=[], MarketVerdict="unknown", MarketConfidence=0.0, MarketRatioToP90=0.0)
+        return PriceLookupResponse(
+            source_count=0,
+            tokens_used=[],
+            market_verdict="NO_DATA",
+            market_confidence="LOW",
+            market_ratio_to_p90=None,
+            debug={"reason": "empty_desc"} if payload.debug else {}
+        )
 
     tokens = _extract_search_tokens(desc, limit=int(payload.token_limit or 6))
     if not tokens:
-        return PriceLookupResponse(source_count=0, tokens_used=[], MarketVerdict="unknown", MarketConfidence=0.0, MarketRatioToP90=0.0)
+        return PriceLookupResponse(
+            source_count=0,
+            tokens_used=[],
+            market_verdict="NO_DATA",
+            market_confidence="LOW",
+            market_ratio_to_p90=None,
+            debug={"reason": "no_tokens"} if payload.debug else {}
+        )
 
     brand = _normalize_for_search(payload.brand or "")
     min_price = float(payload.min_price or 0.0)
-    observed_price = float(payload.observed_price or 0.0)
-    want_debug = bool(payload.debug)
-
     table_fqn = _bq_table_fqn()
 
-    # search in title+description
-    search_expr = "LOWER(CONCAT(IFNULL(title,''), ' ', IFNULL(description,'')))"
+    # Search field: title + description (better recall)
+    hay = "LOWER(CONCAT(IFNULL(title,''), ' ', IFNULL(description,'')))"
 
     where_clauses = ["price > @min_price"]
     params = [bigquery.ScalarQueryParameter("min_price", "FLOAT64", min_price)]
 
     for i, tok in enumerate(tokens):
         pname = f"t{i}"
-        where_clauses.append(f"{search_expr} LIKE CONCAT('%', @{pname}, '%')")
+        where_clauses.append(f"{hay} LIKE CONCAT('%', @{pname}, '%')")
         params.append(bigquery.ScalarQueryParameter(pname, "STRING", tok))
 
     if brand:
         where_clauses.append("LOWER(brand) LIKE CONCAT('%', @brand, '%')")
         params.append(bigquery.ScalarQueryParameter("brand", "STRING", brand))
 
-    # noise filter always ON (safe)
-    where_clauses.append(f"NOT REGEXP_CONTAINS({search_expr}, r'{_NOISE_REGEX}')")
+    if bool(payload.noise_filter):
+        where_clauses.append(f"NOT REGEXP_CONTAINS({hay}, r'{_NOISE_REGEX}')")
 
     sql = f"""
     SELECT
@@ -1107,60 +1184,62 @@ def price_lookup(payload: PriceLookupRequest):
     client = _get_bq_client()
     job_config = bigquery.QueryJobConfig(query_parameters=params)
 
+    # optional: dataset location if you set env BQ_LOCATION (e.g. "EU")
+    bq_location = os.getenv("BQ_LOCATION", "").strip() or None
+
     try:
-        rows = list(client.query(sql, job_config=job_config).result())
+        job = client.query(sql, job_config=job_config, location=bq_location)
+        rows = list(job.result())
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"BigQuery query failed: {e}")
 
     if not rows:
-        verdict, conf, ratio = _market_verdict(observed_price, 0.0, 0)
+        conf = _compute_market_confidence(0, tokens)
+        verdict, ratio = _compute_market_verdict(0, payload.unit_price, None)
         return PriceLookupResponse(
             source_count=0,
-            price_min=0.0,
-            price_median=0.0,
-            price_max=0.0,
-            price_p90=0.0,
             tokens_used=tokens,
-            MarketVerdict=verdict,
-            MarketConfidence=conf,
-            MarketRatioToP90=ratio,
-            debug={"sql": sql} if want_debug else {}
+            market_verdict=verdict,
+            market_confidence=conf,
+            market_ratio_to_p90=ratio,
+            debug={"table_fqn": table_fqn, "sql": sql, "tokens_used": tokens, "brand_filter": brand or None, "min_price": min_price, "noise_filter": bool(payload.noise_filter)} if payload.debug else {}
         )
 
     r0 = rows[0]
-    sc = int(r0.get("source_count") or 0)
-    pmin = float(r0.get("price_min") or 0.0)
-    pmed = float(r0.get("price_median") or 0.0)
-    pmax = float(r0.get("price_max") or 0.0)
-    pp90 = float(r0.get("price_p90") or 0.0)
+    source_count = int(r0.get("source_count") or 0)
+    price_min = float(r0.get("price_min")) if r0.get("price_min") is not None else None
+    price_median = float(r0.get("price_median")) if r0.get("price_median") is not None else None
+    price_max = float(r0.get("price_max")) if r0.get("price_max") is not None else None
+    price_p90 = float(r0.get("price_p90")) if r0.get("price_p90") is not None else None
 
-    verdict, conf, ratio = _market_verdict(observed_price, pp90, sc)
+    conf = _compute_market_confidence(source_count, tokens)
+    verdict, ratio = _compute_market_verdict(source_count, payload.unit_price, price_p90)
 
-    dbg = {}
-    if want_debug:
+    dbg: Dict[str, Any] = {}
+    if payload.debug:
         dbg = {
             "table_fqn": table_fqn,
             "sql": sql,
             "tokens_used": tokens,
             "brand_filter": brand or None,
             "min_price": min_price,
-            "noise_filter": True,
+            "noise_filter": bool(payload.noise_filter),
             "identity": {
-                "bq_client_project": getattr(client, "project", None),
-                "bq_location_env": os.getenv("BQ_LOCATION", None),
+                "bq_client_project": client.project,
+                "bq_location_env": bq_location,
             }
         }
 
     return PriceLookupResponse(
-        source_count=sc,
-        price_min=pmin,
-        price_median=pmed,
-        price_max=pmax,
-        price_p90=pp90,
+        source_count=source_count,
+        price_min=price_min,
+        price_median=price_median,
+        price_max=price_max,
+        price_p90=price_p90,
         tokens_used=tokens,
-        MarketVerdict=verdict,
-        MarketConfidence=float(conf),
-        MarketRatioToP90=float(ratio),
+        market_verdict=verdict,
+        market_confidence=conf,
+        market_ratio_to_p90=ratio,
         debug=dbg
     )
 
