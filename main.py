@@ -7,7 +7,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel, Field
-from deviz_internal_check import internal_deviz_check
+
+# ✅ UPDATE: import corect (payload model + functie)
+from deviz_internal_check import DevizInternalInput, internal_deviz_check
 
 # --- BigQuery imports (safe) ---
 try:
@@ -70,6 +72,18 @@ class DevizResponse(BaseModel):
     sum_guess_from_lines: Optional[float] = None
     ocr_text_raw: Optional[str] = None
     debug: Dict[str, Any] = Field(default_factory=dict)
+
+
+# ✅ UPDATE: helper ca sa bagi BaseModel-uri in debug fara crash
+def _bm_to_dict(x: Any) -> Any:
+    try:
+        if hasattr(x, "model_dump"):
+            return x.model_dump()
+        if hasattr(x, "dict"):
+            return x.dict()
+        return x
+    except Exception:
+        return x
 
 
 # =========================
@@ -978,24 +992,22 @@ def _process_image(image_bytes: bytes) -> DevizResponse:
             "primary_used_parser": primary.debug.get("used_parser"),
         })
 
-        # 🔹 INTERNAL CHECK (SAFE)
+        # ✅ UPDATE: INTERNAL CHECK (corect: trimiti payload)
         internal = internal_deviz_check(
-            items=fb.items,
-            totals=fb.totals
+            DevizInternalInput(items=fb.items, totals=fb.totals)
         )
-        fb.debug["internal_check"] = internal
+        fb.debug["internal_check"] = _bm_to_dict(internal)
 
         return fb
 
     if not ok:
         primary.warnings = (primary.warnings or []) + ["primary_low_confidence: " + ",".join(reasons)]
 
-    # 🔹 INTERNAL CHECK (SAFE)
+    # ✅ UPDATE: INTERNAL CHECK (corect: trimiti payload)
     internal = internal_deviz_check(
-        items=primary.items,
-        totals=primary.totals
+        DevizInternalInput(items=primary.items, totals=primary.totals)
     )
-    primary.debug["internal_check"] = internal
+    primary.debug["internal_check"] = _bm_to_dict(internal)
 
     return primary
 
