@@ -268,7 +268,7 @@ def internal_deviz_check(payload: DevizInternalInput) -> DevizInternalResult:
             InternalVerdict="INSUFFICIENT_DATA",
             InternalFlags=", ".join(flags_unique),
             LaborSanityResult="SKIPPED" if len(labor) == 0 else "OK",
-            MathConsistency="SKIPPED",
+            MathConsistency="INSUFFICIENT_DATA",
             VATCheck="NOT_APPLICABLE",
             debug=dbg
         )
@@ -276,7 +276,7 @@ def internal_deviz_check(payload: DevizInternalInput) -> DevizInternalResult:
     # =========================
     # 1) MathConsistency: nu dublam calculele din main.py
     # =========================
-    math_consistency = "SKIPPED"
+    math_consistency = "INSUFFICIENT_DATA"
 
     # =========================
     # 2) Totals sanity (soft) - semnale, nu "contabilitate"
