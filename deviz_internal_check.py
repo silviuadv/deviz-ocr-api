@@ -1,14 +1,23 @@
-# deviz_internal_check.py
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Literal
 from pydantic import BaseModel, Field
+import math
+import re
+from statistics import median
 
+# =====================================================
+# Airtable / Make SAFE ENUMS — NU SE SCHIMBA
+# =====================================================
 
-# Airtable-safe fixed enums (DO NOT CHANGE STRINGS)
 MathStatus = Literal["OK", "MISMATCH", "INSUFFICIENT_DATA"]
 InternalVerdict = Literal["OK", "SUSPICIOUS", "BAD", "INSUFFICIENT_DATA"]
+VATStatus = Literal["OK", "INCONSISTENT", "NOT_APPLICABLE"]
+LaborStatus = Literal["OK", "WARN", "FAIL"]
 
+# =====================================================
+# INPUT MODELS
+# =====================================================
 
 class DevizInternalItem(BaseModel):
     desc: str = ""
@@ -33,467 +42,244 @@ class DevizInternalInput(BaseModel):
     items: List[DevizInternalItem] = Field(default_factory=list)
     totals: DevizInternalTotals = Field(default_factory=DevizInternalTotals)
 
+# =====================================================
+# OUTPUT MODEL (Make/Airtable READY)
+# =====================================================
 
 class DevizInternalOutput(BaseModel):
-    # Airtable-safe fixed enums
-    math_consistency: MathStatus = "INSUFFICIENT_DATA"
-    internal_verdict: InternalVerdict = "INSUFFICIENT_DATA"
+    MathConsistency: MathStatus
+    InternalVerdict: InternalVerdict
+    VATCheck: VATStatus
+    LaborSanityResult: LaborStatus
 
-    # tipologii
-    typology_flags: List[str] = Field(default_factory=list)
-    typology_score: float = 0.0  # 0..100
-    confidence: Literal["LOW", "MED", "HIGH"] = "LOW"
+    InternalScore: int
+    InternalFlags: str
+    confidence: Literal["LOW", "MED", "HIGH"]
 
-    # details
-    reasons: List[str] = Field(default_factory=list)
     debug: Dict[str, Any] = Field(default_factory=dict)
 
+# =====================================================
+# HELPERS
+# =====================================================
 
-# -------------------------
-# helpers
-# -------------------------
-
-def _nz(x: Optional[float]) -> Optional[float]:
+def _f(x: Optional[float]) -> Optional[float]:
     try:
-        if x is None:
-            return None
-        v = float(x)
-        return v
+        return None if x is None else float(x)
     except Exception:
         return None
 
-def _sum_items(items: List[DevizInternalItem], kind: Optional[str] = None) -> float:
-    s = 0.0
-    for it in items or []:
-        if kind and it.kind != kind:
-            continue
-        try:
-            s += float(it.line_total or 0.0)
-        except Exception:
-            pass
-    return float(s)
+def _sum(items: List[DevizInternalItem], kind: Optional[str] = None) -> float:
+    return sum(float(i.line_total or 0.0) for i in items if not kind or i.kind == kind)
 
-def _count_items(items: List[DevizInternalItem], kind: Optional[str] = None) -> int:
-    if not items:
-        return 0
-    if not kind:
-        return len(items)
-    return sum(1 for it in items if it.kind == kind)
-
-def _abs(x: float) -> float:
-    return x if x >= 0 else -x
-
-def _approx(a: Optional[float], b: Optional[float], tol_abs: float = 2.0, tol_rel: float = 0.02) -> bool:
+def _approx(a: Optional[float], b: Optional[float], abs_tol: float = 5.0, rel_tol: float = 0.02) -> bool:
     if a is None or b is None:
         return False
-    da = _abs(float(a) - float(b))
-    if da <= tol_abs:
+    diff = abs(a - b)
+    if diff <= abs_tol:
         return True
-    denom = max(1.0, _abs(float(b)))
-    return (da / denom) <= tol_rel
+    return diff / max(1.0, abs(b)) <= rel_tol
 
-def _ratio(a: Optional[float], b: Optional[float]) -> Optional[float]:
-    try:
-        if a is None or b is None:
-            return None
-        b = float(b)
-        if b == 0:
-            return None
-        return float(a) / b
-    except Exception:
-        return None
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").lower().strip())
 
-def _norm_desc(s: str) -> str:
-    s = (s or "").strip().lower()
-    # normalizeaza spatii
-    s = " ".join(s.split())
-    return s
+# =====================================================
+# 1. MATH CONSISTENCY — STRICT, FARA INVENTII
+# =====================================================
 
+def _math_consistency(payload: DevizInternalInput) -> (MathStatus, List[str], Dict[str, Any]):
+    items = payload.items
+    t = payload.totals
 
-# -------------------------
-# math consistency (uses main.py totals/items, no parsing)
-# -------------------------
+    gt = _f(t.grand_total)
+    mat = _f(t.materials)
+    lab = _f(t.labor)
+    vat = _f(t.vat)
+    net = _f(t.subtotal_no_vat)
 
-def _math_consistency(payload: DevizInternalInput) -> Dict[str, Any]:
-    items = payload.items or []
-    t = payload.totals or DevizInternalTotals()
+    sum_all = _sum(items)
+    sum_parts = _sum(items, "part")
+    sum_labor = _sum(items, "labor")
 
-    gt = _nz(t.grand_total)
-    mat = _nz(t.materials)
-    lab = _nz(t.labor)
-    vat = _nz(t.vat)
-    sub_no_vat = _nz(t.subtotal_no_vat)
-
-    sum_all = _sum_items(items)
-    sum_parts = _sum_items(items, "part")
-    sum_labor = _sum_items(items, "labor")
-
-    checks: List[Dict[str, Any]] = []
+    checks = 0
+    mismatches = 0
     reasons: List[str] = []
-    status: MathStatus = "INSUFFICIENT_DATA"
 
-    # we define "have_lines" as: at least one non-zero line_total
-    have_lines = _abs(sum_all) > 0.01
-
-    # check 1: m + l = gt
     if gt is not None and mat is not None and lab is not None:
-        expected = float(mat) + float(lab)
-        ok = _approx(expected, gt, tol_abs=5.0, tol_rel=0.01)
-        checks.append({
-            "name": "grand_total_vs_materials_plus_labor",
-            "expected": expected,
-            "actual": gt,
-            "ok": ok,
-        })
-        if not ok:
-            reasons.append("totals_mismatch_gt_vs_m_plus_l")
-            status = "MISMATCH"
-        else:
-            status = "OK"
+        checks += 1
+        if not _approx(mat + lab, gt, 10.0):
+            mismatches += 1
+            reasons.append("grand_total_vs_materials_plus_labor")
 
-    # check 2: totals.materials vs sum(part lines)
-    if mat is not None and have_lines:
-        ok = _approx(sum_parts, mat, tol_abs=5.0, tol_rel=0.02)
-        checks.append({
-            "name": "materials_total_vs_sum_part_lines",
-            "expected": sum_parts,
-            "actual": mat,
-            "ok": ok,
-        })
-        if not ok:
+    if mat is not None and sum_parts > 0:
+        checks += 1
+        if not _approx(sum_parts, mat):
+            mismatches += 1
             reasons.append("materials_total_mismatch")
-            status = "MISMATCH" if status != "OK" else "MISMATCH"
-        else:
-            if status == "INSUFFICIENT_DATA":
-                status = "OK"
 
-    # check 3: totals.labor vs sum(labor lines)
-    if lab is not None and have_lines:
-        ok = _approx(sum_labor, lab, tol_abs=5.0, tol_rel=0.02)
-        checks.append({
-            "name": "labor_total_vs_sum_labor_lines",
-            "expected": sum_labor,
-            "actual": lab,
-            "ok": ok,
-        })
-        if not ok:
+    if lab is not None and sum_labor > 0:
+        checks += 1
+        if not _approx(sum_labor, lab):
+            mismatches += 1
             reasons.append("labor_total_mismatch")
-            status = "MISMATCH" if status != "OK" else "MISMATCH"
-        else:
-            if status == "INSUFFICIENT_DATA":
-                status = "OK"
 
-    # check 4: sub_no_vat + vat = grand_total
-    if gt is not None and sub_no_vat is not None:
-        if vat is not None:
-            expected = float(sub_no_vat) + float(vat)
-            ok = _approx(expected, gt, tol_abs=3.0, tol_rel=0.01)
-            checks.append({
-                "name": "grand_total_vs_subtotal_plus_vat",
-                "expected": expected,
-                "actual": gt,
-                "ok": ok,
-            })
-            if not ok:
-                reasons.append("grand_total_mismatch_subtotal_plus_vat")
-                status = "MISMATCH"
-            else:
-                if status == "INSUFFICIENT_DATA":
-                    status = "OK"
-        else:
-            # we can still sanity-check implied vat
-            implied_vat = float(gt) - float(sub_no_vat)
-            checks.append({
-                "name": "implied_vat_from_grand_minus_subtotal",
-                "implied_vat": implied_vat,
-                "ok": True,  # informational
-            })
-            if status == "INSUFFICIENT_DATA":
-                status = "OK"
+    if gt is not None and sum_all > 0:
+        checks += 1
+        if not _approx(sum_all, gt, 15.0):
+            mismatches += 1
+            reasons.append("grand_total_vs_items_sum")
 
-    # check 5: grand_total vs sum(lines) if both present
-    if gt is not None and have_lines:
-        ok = _approx(sum_all, gt, tol_abs=10.0, tol_rel=0.02)
-        checks.append({
-            "name": "grand_total_vs_sum_all_lines",
-            "expected": sum_all,
-            "actual": gt,
-            "ok": ok,
-        })
-        if not ok:
-            reasons.append("grand_total_vs_items_sum_suspicious")
-            status = "MISMATCH"
+    if checks == 0:
+        return "INSUFFICIENT_DATA", ["not_enough_numeric_data"], {}
 
-    # if we did zero meaningful checks => insufficient data
-    meaningful = [c for c in checks if c.get("name") in (
-        "grand_total_vs_materials_plus_labor",
-        "materials_total_vs_sum_part_lines",
-        "labor_total_vs_sum_labor_lines",
-        "grand_total_vs_subtotal_plus_vat",
-        "grand_total_vs_sum_all_lines",
-    )]
-    if len(meaningful) == 0:
-        status = "INSUFFICIENT_DATA"
-        if not reasons:
-            reasons.append("not_enough_data_for_math_checks")
+    if mismatches > 0:
+        return "MISMATCH", reasons, {}
 
-    # severity hint (used by verdict)
-    severity = 0.0
-    if gt is not None and have_lines:
-        delta = _abs(float(gt) - float(sum_all))
-        severity = max(severity, delta)
+    return "OK", [], {}
 
-    return {
-        "status": status,
-        "reasons": reasons,
-        "checks": checks,
-        "stats": {
-            "sum_all_lines": sum_all,
-            "sum_part_lines": sum_parts,
-            "sum_labor_lines": sum_labor,
-            "have_lines": have_lines,
-            "grand_total": gt,
-            "materials": mat,
-            "labor": lab,
-            "vat": vat,
-            "subtotal_no_vat": sub_no_vat,
-            "max_abs_delta_hint": severity,
-        }
-    }
+# =====================================================
+# 2. VAT CHECK
+# =====================================================
 
+def _vat_check(payload: DevizInternalInput) -> VATStatus:
+    t = payload.totals
+    gt = _f(t.grand_total)
+    net = _f(t.subtotal_no_vat)
+    vat = _f(t.vat)
 
-# -------------------------
-# typologies (fraud patterns)
-# -------------------------
+    if gt is None or net is None or net <= 0:
+        return "NOT_APPLICABLE"
 
-def _typologies(payload: DevizInternalInput, math_info: Dict[str, Any]) -> Dict[str, Any]:
-    items = payload.items or []
-    t = payload.totals or DevizInternalTotals()
+    if vat is not None:
+        expected = net * 0.19
+        return "OK" if _approx(vat, expected, 3.0) else "INCONSISTENT"
 
-    gt = _nz(t.grand_total)
-    mat = _nz(t.materials)
-    lab = _nz(t.labor)
-    vat = _nz(t.vat)
-    sub_no_vat = _nz(t.subtotal_no_vat)
+    implied = gt - net
+    rate = implied / net if implied > 0 else None
 
-    sum_all = float(math_info.get("stats", {}).get("sum_all_lines") or 0.0)
-    sum_parts = float(math_info.get("stats", {}).get("sum_part_lines") or 0.0)
-    sum_labor = float(math_info.get("stats", {}).get("sum_labor_lines") or 0.0)
-    have_lines = bool(math_info.get("stats", {}).get("have_lines"))
+    if rate and 0.16 <= rate <= 0.22:
+        return "OK"
 
+    return "INCONSISTENT"
+
+# =====================================================
+# 3. LABOR SANITY
+# =====================================================
+
+def _labor_sanity(payload: DevizInternalInput) -> LaborStatus:
+    labor = [i for i in payload.items if i.kind == "labor" and i.line_total > 0]
+
+    if not labor:
+        return "OK"
+
+    hours = sum(i.qty for i in labor if i.qty > 0)
+    value = sum(i.line_total for i in labor)
+
+    if hours <= 0:
+        return "FAIL"
+
+    rate = value / hours
+
+    if rate < 30 or rate > 450:
+        return "WARN"
+
+    small_chunks = [i for i in labor if 0 < i.qty <= 0.4]
+    if len(small_chunks) >= max(3, int(0.4 * len(labor))):
+        return "WARN"
+
+    return "OK"
+
+# =====================================================
+# 4. TYPOLOGII DE TEPARI (AICI E GREUL)
+# =====================================================
+
+def _typologies(payload: DevizInternalInput, math_status: MathStatus) -> (int, List[str]):
+    items = payload.items
+    t = payload.totals
+
+    gt = _f(t.grand_total)
+    sum_all = _sum(items)
+
+    score = 0
     flags: List[str] = []
-    reasons: List[str] = []
-    score = 0.0
 
-    # T1: labor value hidden (lots of labor lines with zero pricing, but labor total exists)
-    labor_items = [it for it in items if it.kind == "labor"]
-    labor_zero_pricing = [
-        it for it in labor_items
-        if (float(it.line_total or 0.0) <= 0.0) or (float(it.unit_price or 0.0) <= 0.0)
-    ]
-    if len(labor_items) >= 2 and len(labor_zero_pricing) / max(1, len(labor_items)) >= 0.6 and (lab or 0.0) >= 100.0:
-        flags.append("labor_value_hidden_in_vague_descriptions")
-        score += 18.0
-        reasons.append("labor lines missing unit_price/line_total while labor total is significant")
-
-    # T2: totals mismatch is itself a typology (rely on math_info reasons)
-    if "grand_total_vs_items_sum_suspicious" in (math_info.get("reasons") or []):
-        flags.append("grand_total_vs_items_sum_suspicious")
-        score += 22.0
-
-    if "labor_total_mismatch" in (math_info.get("reasons") or []):
-        flags.append("labor_total_mismatch")
-        score += 18.0
-
-    if "materials_total_mismatch" in (math_info.get("reasons") or []):
-        flags.append("materials_total_mismatch")
-        score += 14.0
-
-    # T3: VAT inferred from grand vs net approx 19% (only if we can infer)
-    # If we have (grand_total and subtotal_no_vat), check implied vat rate.
-    if gt is not None and sub_no_vat is not None and sub_no_vat > 0:
-        implied_vat = float(gt) - float(sub_no_vat)
-        rate = _ratio(implied_vat, sub_no_vat)
-        if rate is not None and 0.16 <= rate <= 0.22 and vat is None:
-            flags.append("vat_inferred_from_grand_vs_net_approx_19pct")
-            score += 8.0
-
-    # T4: too many round numbers (unit prices / line totals)
-    # Heuristic: if a lot of unit_price are multiples of 10 or 100, its suspicious-ish (low weight)
-    def is_round(v: float) -> bool:
-        # multiples of 10 or 100 (treat decimals)
-        if v <= 0:
-            return False
-        if abs(v - round(v)) < 1e-6:  # integer
-            iv = int(round(v))
-            return (iv % 10 == 0) or (iv % 100 == 0)
-        return False
-
-    prices = [float(it.unit_price or 0.0) for it in items if float(it.unit_price or 0.0) > 0]
-    if len(prices) >= 4:
-        round_cnt = sum(1 for p in prices if is_round(p))
-        if round_cnt / max(1, len(prices)) >= 0.75:
-            flags.append("suspicious_rounding_pattern")
-            score += 6.0
-
-    # T5: duplicates / near duplicates
-    seen: Dict[str, int] = {}
-    for it in items:
-        k = f"{it.kind}:{_norm_desc(it.desc)}"
-        if len(k) < 8:
-            continue
-        seen[k] = seen.get(k, 0) + 1
-    dup = [k for k, c in seen.items() if c >= 2]
-    if len(dup) >= 2:
-        flags.append("duplicate_or_repeated_lines")
-        score += 10.0
-
-    # T6: missing detail density
-    # many parts without qty/unit_price or line_total (line_total==0)
-    part_items = [it for it in items if it.kind == "part"]
-    part_missing = [
-        it for it in part_items
-        if float(it.qty or 0.0) <= 0.0 or float(it.unit_price or 0.0) <= 0.0 or float(it.line_total or 0.0) <= 0.0
-    ]
-    if len(part_items) >= 3 and (len(part_missing) / max(1, len(part_items)) >= 0.5):
-        flags.append("missing_unit_prices_or_totals_for_parts")
-        score += 10.0
-
-    # normalize score to 0..100
-    score = max(0.0, min(100.0, float(score)))
-
-    # confidence heuristic
-    # higher confidence if we have totals + enough lines
-    conf = "LOW"
-    if (gt is not None or (mat is not None and lab is not None)) and _count_items(items) >= 6:
-        conf = "HIGH" if score >= 40.0 else "MED"
-    elif (gt is not None or have_lines) and _count_items(items) >= 3:
-        conf = "MED"
-
-    return {
-        "flags": flags,
-        "score": score,
-        "confidence": conf,
-        "reasons": reasons,
-        "stats": {
-            "items_count": _count_items(items),
-            "parts_count": _count_items(items, "part"),
-            "labor_count": _count_items(items, "labor"),
-            "sum_all_lines": sum_all,
-            "sum_part_lines": sum_parts,
-            "sum_labor_lines": sum_labor,
-            "grand_total": gt,
-            "materials": mat,
-            "labor": lab,
-            "vat": vat,
-            "subtotal_no_vat": sub_no_vat,
-        }
-    }
-
-
-# -------------------------
-# verdict logic (combines math + typologies)
-# -------------------------
-
-def _internal_verdict(math_status: MathStatus, math_info: Dict[str, Any], ty: Dict[str, Any]) -> Dict[str, Any]:
-    score = float(ty.get("score") or 0.0)
-    flags = ty.get("flags") or []
-    max_abs_delta = float((math_info.get("stats") or {}).get("max_abs_delta_hint") or 0.0)
-
-    # decide data sufficiency
-    # if math is insufficient AND typologies weak => insufficient
-    if math_status == "INSUFFICIENT_DATA" and score < 20.0:
-        return {
-            "verdict": "INSUFFICIENT_DATA",
-            "reasons": ["insufficient_data_math_and_typologies_weak"]
-        }
-
-    # strong mismatch -> BAD
-    # severe mismatch: delta >= 50 OR relative big mismatch signal
-    severe_mismatch = False
+    # T1 — matematica nu iese
     if math_status == "MISMATCH":
-        if max_abs_delta >= 50.0:
-            severe_mismatch = True
-        # also if we have explicit grand_total mismatch in reasons, treat as severe if score also high
-        if "grand_total_vs_items_sum_suspicious" in (math_info.get("reasons") or []) and max_abs_delta >= 25.0:
-            severe_mismatch = True
+        score += 25
+        flags.append("math_mismatch")
 
-    if severe_mismatch and score >= 30.0:
-        return {
-            "verdict": "BAD",
-            "reasons": ["severe_math_mismatch_and_suspicious_typologies"]
-        }
-    if severe_mismatch:
-        return {
-            "verdict": "BAD",
-            "reasons": ["severe_math_mismatch"]
-        }
+    # T2 — ascunde valoare in manopera vaga
+    labor = [i for i in items if i.kind == "labor"]
+    vague_labor = [i for i in labor if i.qty == 0 or i.unit_price == 0]
+    if len(vague_labor) >= 2:
+        score += 20
+        flags.append("labor_value_hidden")
 
-    # SUSPICIOUS rules
-    if math_status == "MISMATCH":
-        return {
-            "verdict": "SUSPICIOUS",
-            "reasons": ["math_mismatch"]
-        }
+    # T3 — total mare, linii putine
+    if gt and len(items) <= 3 and gt >= 500:
+        score += 15
+        flags.append("too_few_lines_for_total")
 
-    # typology-driven suspicion
-    if score >= 55.0:
-        return {
-            "verdict": "SUSPICIOUS",
-            "reasons": ["typology_score_high"]
-        }
+    # T4 — fragmentare artificiala
+    hours = [i.qty for i in labor if i.qty > 0]
+    if hours:
+        if median(hours) <= 0.4 and len(hours) >= 5:
+            score += 15
+            flags.append("labor_fragmentation")
 
-    # some flags are stronger triggers even with moderate score
-    strong_flags = {
-        "labor_value_hidden_in_vague_descriptions",
-        "grand_total_vs_items_sum_suspicious",
-        "labor_total_mismatch",
-        "materials_total_mismatch",
-    }
-    if any(f in strong_flags for f in flags) and score >= 35.0:
-        return {
-            "verdict": "SUSPICIOUS",
-            "reasons": ["strong_typology_flags_present"]
-        }
+    # T5 — sume rotunde suspect
+    prices = [i.unit_price for i in items if i.unit_price > 0]
+    round_prices = [p for p in prices if p % 10 == 0]
+    if prices and len(round_prices) / len(prices) >= 0.7:
+        score += 10
+        flags.append("suspicious_round_prices")
 
-    return {
-        "verdict": "OK",
-        "reasons": []
-    }
+    return min(100, score), flags
 
+# =====================================================
+# 5. VERDICT FINAL INTERN
+# =====================================================
 
-# -------------------------
-# public API
-# -------------------------
+def _internal_verdict(math_status: MathStatus, score: int) -> InternalVerdict:
+    if math_status == "INSUFFICIENT_DATA" and score < 20:
+        return "INSUFFICIENT_DATA"
+
+    if score >= 70:
+        return "BAD"
+
+    if score >= 40 or math_status == "MISMATCH":
+        return "SUSPICIOUS"
+
+    return "OK"
+
+# =====================================================
+# PUBLIC API
+# =====================================================
 
 def internal_deviz_check(payload: DevizInternalInput) -> DevizInternalOutput:
-    # 1) math
-    math_info = _math_consistency(payload)
-    math_status: MathStatus = math_info["status"]
+    math_status, math_reasons, _ = _math_consistency(payload)
+    vat_status = _vat_check(payload)
+    labor_status = _labor_sanity(payload)
 
-    # 2) typologies
-    ty = _typologies(payload, math_info)
+    score, flags = _typologies(payload, math_status)
+    verdict = _internal_verdict(math_status, score)
 
-    # 3) internal verdict
-    v = _internal_verdict(math_status, math_info, ty)
+    confidence = "LOW"
+    if score >= 60:
+        confidence = "HIGH"
+    elif score >= 30:
+        confidence = "MED"
 
-    out = DevizInternalOutput(
-        math_consistency=math_status,
-        internal_verdict=v["verdict"],
-
-        typology_flags=list(ty.get("flags") or []),
-        typology_score=float(ty.get("score") or 0.0),
-        confidence=ty.get("confidence") or "LOW",
-
-        reasons=(math_info.get("reasons") or []) + (ty.get("reasons") or []) + (v.get("reasons") or []),
+    return DevizInternalOutput(
+        MathConsistency=math_status,
+        InternalVerdict=verdict,
+        VATCheck=vat_status,
+        LaborSanityResult=labor_status,
+        InternalScore=score,
+        InternalFlags=", ".join(flags),
+        confidence=confidence,
         debug={
-            "math": {
-                "checks": math_info.get("checks") or [],
-                "stats": math_info.get("stats") or {},
-            },
-            "typologies": {
-                "stats": ty.get("stats") or {},
-            },
+            "sum_all_lines": _sum(payload.items),
+            "sum_parts": _sum(payload.items, "part"),
+            "sum_labor": _sum(payload.items, "labor"),
         }
     )
-    return out
