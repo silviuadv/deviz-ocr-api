@@ -1,26 +1,33 @@
-from typing import List, Dict, Any, Optional, Tuple
-from fastapi import APIRouter
+# deviz_internal_check.py
+# Goal:
+# - no "SKIPPED" anywhere
+# - Airtable-friendly single select values: OK | MISMATCH | INSUFFICIENT_DATA
+# - do NOT re-invent totals when we already have them from main.py
+# - correctly handle net vs gross (subtotal_no_vat + vat = grand_total)
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Literal, Optional, Tuple
 from pydantic import BaseModel, Field
-import re
-from statistics import median
 
-router = APIRouter()
 
 # =========================
-# INPUT MODELS (compatibile cu main.py)
+# Models (compatible with main.py)
 # =========================
 
-class ExtractedItem(BaseModel):
+SelectMath = Literal["OK", "MISMATCH", "INSUFFICIENT_DATA"]
+ItemKind = Literal["part", "labor"]
+
+class DevizInternalItem(BaseModel):
     desc: str = ""
-    kind: str = "part"  # "part" | "labor"
+    kind: ItemKind = "part"
     qty: float = 0.0
     unit: str = ""
     unit_price: float = 0.0
     line_total: float = 0.0
     currency: str = "RON"
 
-
-class Totals(BaseModel):
+class DevizInternalTotals(BaseModel):
     materials: Optional[float] = None
     labor: Optional[float] = None
     vat: Optional[float] = None
@@ -28,487 +35,280 @@ class Totals(BaseModel):
     grand_total: Optional[float] = None
     currency: str = "RON"
 
-
 class DevizInternalInput(BaseModel):
-    items: List[ExtractedItem] = Field(default_factory=list)
-    totals: Totals = Field(default_factory=Totals)
+    items: List[DevizInternalItem] = Field(default_factory=list)
+    totals: DevizInternalTotals = Field(default_factory=DevizInternalTotals)
 
-# =========================
-# OUTPUT MODEL (Airtable-ready)
-# =========================
+class DevizInternalCheckResult(BaseModel):
+    # Airtable single-select (exact)
+    math_consistency: SelectMath = "INSUFFICIENT_DATA"
 
-class DevizInternalResult(BaseModel):
-    InternalScore: int
-    InternalVerdict: str
-    InternalFlags: str
-    LaborSanityResult: str
-    MathConsistency: str
-    VATCheck: str
+    # Optional: keep your existing pipeline fields if you already use them
+    internal_status: str = "OK"          # OK / SUSPICIOUS / etc (free text if you want)
+    internal_score: float = 0.0          # 0..100 (heuristic)
+    reasons: List[str] = Field(default_factory=list)  # typologies / flags
     debug: Dict[str, Any] = Field(default_factory=dict)
 
+
 # =========================
-# HELPERS
+# Helpers
 # =========================
 
-def _safe_ratio(a: Optional[float], b: Optional[float]) -> Optional[float]:
+def _is_num(x: Optional[float]) -> bool:
+    return x is not None
+
+def _safe_float(x: Any) -> Optional[float]:
     try:
-        if a is None or b is None:
+        if x is None:
             return None
-        b = float(b)
-        if b <= 0:
+        if isinstance(x, (int, float)):
+            return float(x)
+        s = str(x).strip()
+        if not s:
             return None
-        return float(a) / b
+        s = s.replace(" ", "")
+        # allow "1,234.56"
+        if "," in s and "." in s:
+            s = s.replace(",", "")
+            return float(s)
+        # allow "123,45"
+        if "," in s and "." not in s:
+            return float(s.replace(",", "."))
+        return float(s)
     except Exception:
         return None
 
-def _clamp_score(x: float) -> int:
-    return max(1, min(100, int(round(x))))
+def _sum_items(items: List[DevizInternalItem]) -> Tuple[float, float, float]:
+    mat = 0.0
+    lab = 0.0
+    total = 0.0
+    for it in items or []:
+        lt = float(it.line_total or 0.0)
+        total += lt
+        if it.kind == "labor":
+            lab += lt
+        else:
+            mat += lt
+    return mat, lab, total
 
-def _f(x: Optional[float]) -> Optional[float]:
-    return None if x is None else float(x)
-
-def _tol(value: float, abs_min: float, rel: float) -> float:
-    return max(abs_min, abs(value) * rel)
-
-def _approx(a: float, b: float, abs_min: float, rel: float) -> bool:
-    return abs(a - b) <= _tol(b, abs_min=abs_min, rel=rel)
-
-def _norm_text(s: str) -> str:
-    s = (s or "").lower().strip()
-    s = re.sub(r"[^a-z0-9ăâîșț\-\._/ ]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-def _tokenize(s: str) -> List[str]:
-    s = _norm_text(s)
-    if not s:
-        return []
-    toks = s.split()
-    stop = {
-        "si","sau","cu","din","de","la","pe","pt","ptr","pentru","in","nr","cod",
-        "buc","buc.","ore","h","um","u.m","um.","ron","lei","tva","total","subtotal",
-        "operatie","operatiune","lucrari","lucrare","manopera","piese","materiale"
-    }
-    out: List[str] = []
-    for t in toks:
-        if t in stop:
-            continue
-        if len(t) <= 2:
-            continue
-        out.append(t)
-    return out
-
-def _jaccard(a: List[str], b: List[str]) -> float:
-    sa, sb = set(a), set(b)
-    if not sa and not sb:
-        return 0.0
-    inter = len(sa & sb)
-    uni = len(sa | sb)
-    return inter / max(1, uni)
-
-def _is_vague_desc(desc: str, kind: str) -> bool:
-    """
-    Nu tratam automat 'scurt' = vag.
-    E vag daca are markeri de 'diverse/alte/taxa/diagnoza' sau e generic pur.
-    """
-    d = _norm_text(desc)
-    if not d:
-        return True
-
-    vague_markers = [
-        "alte operatiuni", "alte operatii", "diverse", "diverse materiale",
-        "materiale auxiliare", "consumabile", "consumabil", "consumabile diverse",
-        "operatiuni conexe", "operatii conexe", "manopera generala", "manopera diversa",
-        "verificare generala", "constatare", "control general", "diagnoza", "diagnostic",
-        "taxa", "taxare", "fee", "servicii", "serviciu"
-    ]
-    if any(m in d for m in vague_markers):
-        return True
-
-    generic_short = {"operatiuni", "operatii", "diverse", "taxa", "servicii", "serviciu", "manopera"}
-    if len(d) <= 12 and d in generic_short:
-        return True
-
-    if kind == "labor" and d in {"manopera", "lucrare", "lucrari"}:
-        return True
-
-    return False
-
-def _top_similar_groups(items: List[ExtractedItem], kind: str, sim_threshold: float = 0.78) -> List[Tuple[str, int]]:
-    """
-    Grupeaza descrieri similare ca sa prinda fragmentare / repetitii.
-    """
-    group_reprs: List[Tuple[str, List[str], int]] = []
-    for it in items:
-        if (it.kind or "").lower().strip() != kind:
-            continue
-        toks = _tokenize(it.desc or "")
-        if not toks:
-            continue
-        placed = False
-        for gi in range(len(group_reprs)):
-            rep, rep_toks, cnt = group_reprs[gi]
-            if _jaccard(toks, rep_toks) >= sim_threshold:
-                group_reprs[gi] = (rep, rep_toks, cnt + 1)
-                placed = True
-                break
-        if not placed:
-            rep = _norm_text(it.desc or "")[:80] or "item"
-            group_reprs.append((rep, toks, 1))
-
-    out = [(rep, cnt) for (rep, _toks, cnt) in group_reprs if cnt >= 2]
-    out.sort(key=lambda x: (-x[1], x[0]))
-    return out[:5]
-
-def _totals_look_coherent(tm: Optional[float], tl: Optional[float], tv: Optional[float], tnet: Optional[float], tg: Optional[float]) -> bool:
-    vals = [v for v in [tm, tl, tv, tnet, tg] if v is not None and v > 0]
-    if len(vals) < 2:
+def _approx_equal(a: Optional[float], b: Optional[float], tol: float) -> bool:
+    if a is None or b is None:
         return False
+    return abs(float(a) - float(b)) <= float(tol)
 
-    if tnet is not None and tv is not None and tg is not None and tnet > 0 and tg > 0:
-        if _approx(tnet + tv, tg, abs_min=5.0, rel=0.03):
-            return True
+def _tol_for_amount(x: float) -> float:
+    # practical tolerance for OCR/calc
+    # <= 1k: 2 lei, <= 10k: 5 lei, else: 10 lei
+    ax = abs(float(x))
+    if ax <= 1000:
+        return 2.0
+    if ax <= 10000:
+        return 5.0
+    return 10.0
 
-    if tm is not None and tl is not None and tg is not None and tg > 0:
-        if _approx(tm + tl, tg, abs_min=10.0, rel=0.04):
-            return True
-        if _approx((tm + tl) * 1.19, tg, abs_min=15.0, rel=0.06):
-            return True
+def _maybe_infer_vat(subtotal_no_vat: Optional[float], grand_total: Optional[float]) -> Optional[float]:
+    if subtotal_no_vat is None or grand_total is None:
+        return None
+    if subtotal_no_vat <= 0 or grand_total <= 0:
+        return None
+    vat = grand_total - subtotal_no_vat
+    # if negative, ignore
+    if vat < -1.0:
+        return None
+    # if tiny negative due to rounding, clamp
+    if vat < 0:
+        vat = 0.0
+    return float(vat)
 
-    if tg is not None and tg > 0 and (tm is not None or tl is not None or tnet is not None):
-        return True
+def _pick_best_net_total(
+    materials: Optional[float],
+    labor: Optional[float],
+    subtotal_no_vat: Optional[float],
+    sum_items_total: float
+) -> Tuple[Optional[float], str]:
+    """
+    Decide what is the best representation of NET total (fara TVA).
+    Priority:
+      1) subtotal_no_vat (explicit)
+      2) materials + labor (explicit)
+      3) sum_items_total (from lines)
+    """
+    if _is_num(subtotal_no_vat) and (subtotal_no_vat or 0) > 0:
+        return float(subtotal_no_vat), "subtotal_no_vat"
+    if _is_num(materials) and _is_num(labor) and (materials or 0) + (labor or 0) > 0:
+        return float(materials or 0) + float(labor or 0), "materials_plus_labor"
+    if sum_items_total > 0:
+        return float(sum_items_total), "sum_items_total"
+    return None, "none"
 
-    return False
 
 # =========================
-# CORE LOGIC (fara dublare calcule "main.py")
+# Core check
 # =========================
 
-def internal_deviz_check(payload: DevizInternalInput) -> DevizInternalResult:
-    flags: List[str] = []
-    dbg: Dict[str, Any] = {}
+def internal_deviz_check(payload: DevizInternalInput) -> DevizInternalCheckResult:
+    totals = payload.totals or DevizInternalTotals()
+    items = payload.items or []
 
-    # 5 tipuri de "tepar" (scor intern doar pt debug)
-    archetypes: Dict[str, float] = {
-        "VAGUL": 0.0,
-        "FRAGMENTATORUL": 0.0,
-        "TOTALISTUL": 0.0,
-        "TVA_ILUZIONISTUL": 0.0,
-        "DUBLATORUL": 0.0,
+    # normalize totals (in case dict was passed in)
+    if isinstance(totals, dict):
+        totals = DevizInternalTotals(**totals)
+    if items and isinstance(items[0], dict):
+        items = [DevizInternalItem(**x) for x in items]
+
+    # sum items
+    sum_mat, sum_lab, sum_items_total = _sum_items(items)
+
+    # extract totals
+    materials = _safe_float(totals.materials)
+    labor = _safe_float(totals.labor)
+    subtotal_no_vat = _safe_float(totals.subtotal_no_vat)
+    vat = _safe_float(totals.vat)
+    grand_total = _safe_float(totals.grand_total)
+
+    reasons: List[str] = []
+    debug: Dict[str, Any] = {
+        "totals_in": {
+            "materials": materials,
+            "labor": labor,
+            "subtotal_no_vat": subtotal_no_vat,
+            "vat": vat,
+            "grand_total": grand_total,
+            "currency": totals.currency or "RON",
+        },
+        "items_sum": {
+            "materials_from_items": round(sum_mat, 2),
+            "labor_from_items": round(sum_lab, 2),
+            "sum_items_total": round(sum_items_total, 2),
+            "items_count": len(items),
+        },
     }
 
-    score = 100.0
+    # basic sufficiency
+    any_total_present = any(_is_num(x) and (x or 0) > 0 for x in [materials, labor, subtotal_no_vat, vat, grand_total])
+    any_items_present = len(items) > 0 and (sum_items_total > 0)
 
-    items = payload.items or []
-    totals = payload.totals or Totals()
-
-    # normalize kinds
-    for it in items:
-        it.kind = (it.kind or "part").lower().strip()
-        if it.kind not in ("part", "labor"):
-            it.kind = "part"
-
-    parts = [i for i in items if i.kind == "part"]
-    labor = [i for i in items if i.kind == "labor"]
-
-    dbg["items_count"] = len(items)
-    dbg["parts_count"] = len(parts)
-    dbg["labor_count"] = len(labor)
-
-    # totals (trusted as coming from main.py)
-    tm = _f(totals.materials)
-    tl = _f(totals.labor)
-    tv = _f(totals.vat)
-    tnet = _f(totals.subtotal_no_vat)
-    tg = _f(totals.grand_total)
-
-    # sums (folosite doar pt semnale, nu pt "recalculare contabila")
-    sum_parts = sum(float(i.line_total or 0.0) for i in parts)
-    sum_labor = sum(float(i.line_total or 0.0) for i in labor)
-    sum_all = sum(float(i.line_total or 0.0) for i in items)
-
-    dbg["sum_parts"] = sum_parts
-    dbg["sum_labor"] = sum_labor
-    dbg["sum_all"] = sum_all
-
-    totals_coherent = _totals_look_coherent(tm, tl, tv, tnet, tg)
-    dbg["totals_coherent"] = totals_coherent
-
-    # =========================
-    # 0) payload partial / incomplet (deviz complex amestecat -> AI)
-    # =========================
-    partial_payload = False
-    partial_reasons: List[str] = []
-
-    if len(items) <= 1:
-        partial_payload = True
-        partial_reasons.append("too_few_items_for_deviz_level_checks")
-
-    if (tg is not None and tg > 0) and (sum_all > 0) and (sum_all < 0.65 * tg):
-        partial_payload = True
-        partial_reasons.append("sum_all_much_smaller_than_grand_total_likely_missing_items")
-
-    if (tl is not None and tl > 0) and len(labor) == 0:
-        partial_payload = True
-        partial_reasons.append("totals_has_labor_but_no_labor_items")
-
-    if (tm is not None and tm > 0) and len(parts) == 0:
-        partial_payload = True
-        partial_reasons.append("totals_has_materials_but_no_part_items")
-
-    dbg["partial_payload"] = partial_payload
-    dbg["partial_reasons"] = partial_reasons
-
-    if partial_payload:
-        # aici NU mai facem calcule de linii, doar verdict de insuficient
-        flags_unique = list(dict.fromkeys(["partial_payload"] + flags))
-        dbg["archetypes"] = archetypes
-        return DevizInternalResult(
-            InternalScore=49,
-            InternalVerdict="INSUFFICIENT_DATA",
-            InternalFlags=", ".join(flags_unique),
-            LaborSanityResult="SKIPPED" if len(labor) == 0 else "OK",
-            MathConsistency="INSUFFICIENT_DATA",
-            VATCheck="NOT_APPLICABLE",
-            debug=dbg
+    if not any_total_present and not any_items_present:
+        return DevizInternalCheckResult(
+            math_consistency="INSUFFICIENT_DATA",
+            internal_status="OK",
+            internal_score=0.0,
+            reasons=["insufficient_data_no_totals_no_items"],
+            debug=debug
         )
 
-    # =========================
-    # 1) MathConsistency: nu dublam calculele din main.py
-    # =========================
-    math_consistency = "INSUFFICIENT_DATA"
+    # Pick best NET total (fara TVA)
+    net_total, net_source = _pick_best_net_total(materials, labor, subtotal_no_vat, sum_items_total)
+    debug["net_total"] = {"value": net_total, "source": net_source}
 
-    # =========================
-    # 2) Totals sanity (soft) - semnale, nu "contabilitate"
-    # =========================
-    if totals_coherent and tg is not None and tg > 0 and sum_all > 0 and len(items) >= 3:
-        tol_g = _tol(tg, abs_min=10.0, rel=0.05)
-        dbg["grand_tol"] = tol_g
-        dbg["grand_diff"] = (sum_all - tg)
-        if abs(sum_all - tg) > tol_g:
-            flags.append("grand_total_mismatch")
-            score -= 8
-            archetypes["TOTALISTUL"] += 1.5
+    # Determine VAT:
+    # - prefer explicit vat
+    # - else infer if we have grand_total and net_total
+    vat_final = vat if (_is_num(vat) and (vat or 0) >= 0) else _maybe_infer_vat(net_total, grand_total)
+    debug["vat_final"] = vat_final
 
-    if totals_coherent and tm is not None and tm > 0 and sum_parts > 0:
-        tol_m = _tol(tm, abs_min=5.0, rel=0.06)
-        dbg["materials_tol"] = tol_m
-        dbg["materials_diff"] = (sum_parts - tm)
-        if abs(sum_parts - tm) > tol_m:
-            flags.append("materials_total_mismatch")
-            score -= 6
-            archetypes["TOTALISTUL"] += 1.0
+    # Determine expected gross:
+    gross_expected = None
+    gross_source = "none"
+    if net_total is not None and vat_final is not None:
+        gross_expected = net_total + vat_final
+        gross_source = "net_plus_vat"
+    debug["gross_expected"] = {"value": gross_expected, "source": gross_source}
 
-    if totals_coherent and tl is not None and tl > 0 and len(labor) > 0:
-        tol_l = _tol(tl, abs_min=5.0, rel=0.06)
-        dbg["labor_tol"] = tol_l
-        dbg["labor_diff"] = (sum_labor - tl)
-        if abs(sum_labor - tl) > tol_l:
-            flags.append("labor_total_mismatch")
-            score -= 6
-            archetypes["TOTALISTUL"] += 1.0
+    # -------------------------
+    # Consistency checks
+    # -------------------------
 
-    if tg is not None and tg > 0 and sum_all > 0:
-        r = _safe_ratio(tg, sum_all)
-        dbg["grand_over_sum_all_ratio"] = r
-        if r is not None and (r < 0.90 or r > 1.35):
-            flags.append("grand_total_vs_items_sum_suspicious")
-            score -= 4
-            archetypes["TOTALISTUL"] += 0.8
+    mismatches = 0
 
-    # =========================
-    # 3) Labor sanity + "Fragmentatorul"
-    # =========================
-    if len(labor) == 0:
-        labor_sanity = "SKIPPED"
-        dbg["labor_hours"] = 0.0
-        dbg["labor_value"] = 0.0
-        dbg["labor_hourly_rate"] = None
-    else:
-        labor_hours = sum(float(i.qty or 0.0) for i in labor if (i.qty or 0.0) > 0)
-        labor_value = sum(float(i.line_total or 0.0) for i in labor if (i.line_total or 0.0) > 0)
-        hourly_rate = _safe_ratio(labor_value, labor_hours)
+    # 1) If we have explicit materials and labor, verify they add up to explicit subtotal_no_vat (if present)
+    if _is_num(materials) and _is_num(labor) and _is_num(subtotal_no_vat):
+        tol = _tol_for_amount(subtotal_no_vat or 0)
+        if not _approx_equal((materials or 0) + (labor or 0), subtotal_no_vat, tol=tol):
+            mismatches += 1
+            reasons.append("net_mismatch_materials_plus_labor_vs_subtotal_no_vat")
 
-        dbg["labor_hours"] = labor_hours
-        dbg["labor_value"] = labor_value
-        dbg["labor_hourly_rate"] = hourly_rate
+    # 2) If we have items, verify their sums roughly match declared materials/labor (when declared)
+    if len(items) > 0:
+        if _is_num(materials) and (materials or 0) > 0:
+            tol = _tol_for_amount(materials or 0)
+            if not _approx_equal(sum_mat, materials, tol=tol):
+                mismatches += 1
+                reasons.append("materials_mismatch_vs_items_sum")
+        if _is_num(labor) and (labor or 0) > 0:
+            tol = _tol_for_amount(labor or 0)
+            if not _approx_equal(sum_lab, labor, tol=tol):
+                mismatches += 1
+                reasons.append("labor_mismatch_vs_items_sum")
 
-        if labor_hours <= 0 or hourly_rate is None:
-            labor_sanity = "FAIL"
-            flags.append("labor_missing_hours_or_rate")
-            score -= 12
-            archetypes["TOTALISTUL"] += 1.0
-        elif hourly_rate < 30 or hourly_rate > 450:
-            labor_sanity = "WARN"
-            flags.append("labor_hourly_rate_suspicious")
-            score -= 5
-            archetypes["FRAGMENTATORUL"] += 0.8
-        else:
-            labor_sanity = "OK"
+    # 3) If we have grand_total and we can compute expected gross, verify it
+    if _is_num(grand_total) and (grand_total or 0) > 0 and gross_expected is not None:
+        tol = _tol_for_amount(grand_total or 0)
+        if not _approx_equal(gross_expected, grand_total, tol=tol):
+            mismatches += 1
+            reasons.append("gross_mismatch_net_plus_vat_vs_grand_total")
 
-        labor_lines = [it for it in labor if (it.line_total or 0.0) > 0]
-        hours_list = [float(it.qty or 0.0) for it in labor if (it.qty or 0.0) > 0]
-
-        if len(labor_lines) >= 6 and hours_list:
-            small_hours = [h for h in hours_list if 0 < h <= 0.4]
-            dbg["labor_small_hours_count"] = len(small_hours)
-            if len(small_hours) >= max(3, int(0.45 * len(hours_list))):
-                flags.append("labor_fragmentation_many_small_time_entries")
-                score -= 7
-                archetypes["FRAGMENTATORUL"] += 2.0
-
-        if hours_list:
-            try:
-                dbg["labor_hours_median"] = median(hours_list)
-                dbg["labor_hours_max"] = max(hours_list)
-            except Exception:
+    # 4) If we have grand_total but no vat/subtotal to reconcile,
+    #    then ONLY compare net_total with grand_total when VAT is clearly absent (we cannot know here),
+    #    so treat as insufficient (not mismatch) unless difference is tiny.
+    if _is_num(grand_total) and (grand_total or 0) > 0 and gross_expected is None:
+        # If net_total exists and is close, OK. If far, we just don't know (could be VAT included).
+        if net_total is not None:
+            tol = _tol_for_amount(grand_total or 0)
+            if _approx_equal(net_total, grand_total, tol=tol):
                 pass
-
-        sim_groups = _top_similar_groups(items, kind="labor", sim_threshold=0.78)
-        dbg["labor_similar_groups_top"] = sim_groups
-        if sim_groups and sim_groups[0][1] >= 3:
-            flags.append("labor_repeated_similar_operations")
-            score -= 6
-            archetypes["FRAGMENTATORUL"] += 1.5
-
-        vague_labor = [it for it in labor_lines if _is_vague_desc(it.desc or "", kind="labor")]
-        vague_labor_value = sum(float(it.line_total or 0.0) for it in vague_labor)
-        dbg["vague_labor_count"] = len(vague_labor)
-        dbg["vague_labor_value"] = vague_labor_value
-        if labor_value > 0:
-            vague_share = vague_labor_value / labor_value
-            dbg["vague_labor_share"] = vague_share
-            if vague_share >= 0.35 and vague_labor_value >= 150:
-                flags.append("labor_value_hidden_in_vague_descriptions")
-                score -= 9
-                archetypes["VAGUL"] += 2.0
-
-    # =========================
-    # 4) TVA logic (best effort)
-    # =========================
-    vat_check = "NOT_APPLICABLE"
-
-    if tv is not None and tnet is not None and tnet > 0:
-        expected_vat = tnet * 0.19
-        tol_v = _tol(expected_vat, abs_min=2.0, rel=0.05)
-        dbg["vat_expected_from_net"] = expected_vat
-        dbg["vat_tol"] = tol_v
-        dbg["vat_diff"] = (tv - expected_vat)
-        if abs(tv - expected_vat) > tol_v:
-            vat_check = "INCONSISTENT"
-            flags.append("vat_inconsistent")
-            score -= 8
-            archetypes["TVA_ILUZIONISTUL"] += 2.0
-        else:
-            vat_check = "OK"
-
-    elif tv is None and tnet is not None and tg is not None and tnet > 0 and tg > 0:
-        inferred_vat = tg - tnet
-        dbg["vat_inferred_from_grand_minus_net"] = inferred_vat
-        if inferred_vat > 0:
-            expected_vat = tnet * 0.19
-            if _approx(inferred_vat, expected_vat, abs_min=5.0, rel=0.08):
-                vat_check = "OK"
-                flags.append("vat_inferred")
             else:
-                vat_check = "INCONSISTENT"
-                flags.append("vat_grand_minus_net_not_19pct")
-                score -= 5
-                archetypes["TVA_ILUZIONISTUL"] += 1.2
+                reasons.append("cannot_reconcile_grand_total_without_vat_or_subtotal")
+                # do not count as mismatch, data is ambiguous
 
-    else:
-        net_from_totals = None
-        if tm is not None or tl is not None:
-            net_from_totals = float(tm or 0.0) + float(tl or 0.0)
+    # -------------------------
+    # Decide Airtable value (no SKIPPED)
+    # -------------------------
 
-        if net_from_totals is not None and tg is not None and net_from_totals > 0 and tg > 0:
-            dbg["net_from_materials_plus_labor"] = net_from_totals
-            if _approx(tg, net_from_totals, abs_min=10.0, rel=0.03):
-                vat_check = "NOT_APPLICABLE"
-                flags.append("vat_probably_included_in_materials_and_labor_totals")
-            elif _approx(tg, net_from_totals * 1.19, abs_min=15.0, rel=0.05):
-                vat_check = "OK"
-                flags.append("vat_inferred_from_grand_vs_net_approx_19pct")
-            else:
-                vat_check = "NOT_APPLICABLE"
-
-    # =========================
-    # 5) Vagul + Dublatorul (structura)
-    # =========================
-    if len(items) < 3:
-        flags.append("too_few_items")
-        score -= 6
-        archetypes["TOTALISTUL"] += 0.7
-
-    if len(parts) == 0 and len(items) >= 4:
-        flags.append("no_parts")
-        score -= 8
-        archetypes["TOTALISTUL"] += 0.7
-
-    total_value = sum_all if sum_all > 0 else (tg or 0.0)
-
-    vague_all = [it for it in items if _is_vague_desc(it.desc or "", kind=it.kind)]
-    vague_all_value = sum(float(it.line_total or 0.0) for it in vague_all)
-    dbg["vague_all_count"] = len(vague_all)
-    dbg["vague_all_value"] = vague_all_value
-    if total_value and total_value > 0:
-        vague_share_total = vague_all_value / total_value
-        dbg["vague_share_total"] = vague_share_total
-        if vague_share_total >= 0.22 and vague_all_value >= 200:
-            flags.append("value_hidden_in_vague_lines")
-            score -= 9
-            archetypes["VAGUL"] += 2.0
-
-    part_groups = _top_similar_groups(items, kind="part", sim_threshold=0.80)
-    dbg["part_similar_groups_top"] = part_groups
-    if part_groups and part_groups[0][1] >= 3:
-        flags.append("parts_repeated_similar_items")
-        score -= 3
-        archetypes["DUBLATORUL"] += 1.0
-
-    if total_value and total_value > 0:
-        labor_share = _safe_ratio(sum_labor, total_value)
-        dbg["labor_share"] = labor_share
-        if labor_share is not None and labor_share > 0.92 and sum_labor >= 300:
-            flags.append("labor_share_extremely_high")
-            score -= 8
-            archetypes["FRAGMENTATORUL"] += 1.0
-
-    # =========================
-    # 6) Verdict (praguri cerute)
-    # =========================
-    score_i = _clamp_score(score)
-
-    # 100-80 (inclusiv) OK
-    # 79-65 SUSPICIOUS
-    # 64-50 BAD
-    # <=49 INSUFFICIENT_DATA
-    if score_i >= 80:
-        verdict = "OK"
-    elif score_i >= 65:
-        verdict = "SUSPICIOUS"
-    elif score_i >= 50:
-        verdict = "BAD"
-    else:
-        verdict = "INSUFFICIENT_DATA"
-
-    flags_unique = list(dict.fromkeys([f for f in flags if f]))
-    dbg["archetypes"] = archetypes
-
-    return DevizInternalResult(
-        InternalScore=score_i,
-        InternalVerdict=verdict,
-        InternalFlags=", ".join(flags_unique) if flags_unique else "",
-        LaborSanityResult=labor_sanity,
-        MathConsistency=math_consistency,
-        VATCheck=vat_check,
-        debug=dbg
+    # If we only have ambiguous info (grand_total but no vat/subtotal and no declared m/l),
+    # mark INSUFFICIENT_DATA instead of mismatch.
+    ambiguous_only = (
+        mismatches == 0
+        and any(r == "cannot_reconcile_grand_total_without_vat_or_subtotal" for r in reasons)
+        and not any(r.endswith("_mismatch_vs_items_sum") or r.startswith("net_mismatch") or r.startswith("gross_mismatch") for r in reasons)
     )
 
-# =========================
-# FASTAPI ENDPOINT (apare in /docs)
-# =========================
+    if mismatches > 0:
+        math_consistency: SelectMath = "MISMATCH"
+    else:
+        if ambiguous_only:
+            math_consistency = "INSUFFICIENT_DATA"
+        else:
+            # if we have at least one strong reconciliation path, consider OK
+            has_strong_path = (
+                (_is_num(subtotal_no_vat) and (subtotal_no_vat or 0) > 0)
+                or (_is_num(materials) and _is_num(labor) and (materials or 0) + (labor or 0) > 0)
+                or (len(items) > 0 and sum_items_total > 0)
+            )
+            math_consistency = "OK" if has_strong_path else "INSUFFICIENT_DATA"
 
-@router.post("/deviz_internal_check", response_model=DevizInternalResult)
-def deviz_internal_check_endpoint(payload: DevizInternalInput) -> DevizInternalResult:
-    return internal_deviz_check(payload)
+    # score (simple, stable)
+    # start from 100, subtract per mismatch; clamp
+    score = 100.0
+    score -= 35.0 * float(mismatches)
+    if math_consistency == "INSUFFICIENT_DATA":
+        score = min(score, 40.0)
+    score = max(0.0, min(100.0, score))
+
+    debug["result"] = {
+        "mismatches": mismatches,
+        "math_consistency": math_consistency,
+        "score": score,
+        "reasons": reasons[:],
+    }
+
+    # internal_status: keep lightweight
+    internal_status = "OK" if math_consistency == "OK" else "SUSPICIOUS"
+
+    return DevizInternalCheckResult(
+        math_consistency=math_consistency,
+        internal_status=internal_status,
+        internal_score=round(score, 2),
+        reasons=reasons,
+        debug=debug
+    )
